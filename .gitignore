@@ -1,0 +1,8 @@
+.env
+downloads/
+__pycache__/
+*.py[cod]
+*.log
+assets/logo.png
+bot_state.db*
+github-backup.lock
