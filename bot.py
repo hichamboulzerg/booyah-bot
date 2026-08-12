@@ -23,10 +23,10 @@ from zoneinfo import ZoneInfo
 
 import imageio_ffmpeg
 import requests
-from local_infographic import create_infographic
+from local_infographic import create_carousel
 from requests_toolbelt import MultipartEncoder, MultipartEncoderMonitor
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -307,19 +307,54 @@ async def receive_image_caption(
     return ConversationHandler.END
 
 
-def generate_education_image(
+def generate_education_images(
     topic: str,
     draft_dir: Path,
     local_config: dict,
-) -> tuple[Path, str, str]:
-    image_path = draft_dir / "generated.png"
-    caption, lesson = create_infographic(
+) -> tuple[list[Path], str, str]:
+    return create_carousel(
         topic,
-        image_path,
+        draft_dir,
         local_config["endpoint"],
         local_config["model"],
     )
-    return image_path, caption, lesson
+
+
+async def send_carousel_preview(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    image_paths: list[Path],
+    topic: str,
+    caption: str,
+    keyboard: InlineKeyboardMarkup,
+    regenerated: bool = False,
+) -> None:
+    handles = [path.open("rb") for path in image_paths]
+    try:
+        media = []
+        for index, handle in enumerate(handles):
+            album_caption = None
+            if index == 0:
+                prefix = "New carousel preview" if regenerated else "Carousel preview"
+                album_caption = (f"{prefix}: {topic}\n\n{caption}")[:1024]
+            media.append(InputMediaPhoto(media=handle, caption=album_caption))
+        await context.bot.send_media_group(
+            chat_id=chat_id,
+            media=media,
+            read_timeout=300,
+            write_timeout=300,
+        )
+    finally:
+        for handle in handles:
+            handle.close()
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"{len(image_paths)}-slide lesson ready. Review every slide before "
+            "publishing."
+        ),
+        reply_markup=keyboard,
+    )
 
 
 def image_generation_error_message(exc: Exception) -> str:
@@ -341,8 +376,9 @@ async def create_image_start(
         return ConversationHandler.END
     context.user_data.clear()
     await update.message.reply_text(
-        "Send an educational topic, for example: Python lists, DNS explained, "
-        "or 20 useful Windows shortcuts."
+        "Send any educational topic. I will choose 3 to 5 connected slides with "
+        "clear explanations and practical examples. Topics can be programming, "
+        "technology, science, business, history, language, or another subject."
     )
     return GENERATE_IMAGE_TOPIC
 
@@ -357,14 +393,15 @@ async def receive_generated_image_topic(
         await update.message.reply_text("The topic cannot be empty.")
         return GENERATE_IMAGE_TOPIC
     progress = await update.message.reply_text(
-        "Writing the lesson and generating the notebook-style image…"
+        "Planning the lesson and generating 3 to 5 notebook-style slides. This can "
+        "take several minutes on the local model…"
     )
     image_id = uuid.uuid4().hex
     draft_dir = image_draft_path(context.application.bot_data["image_root"], image_id)
     draft_dir.mkdir(parents=True, exist_ok=False)
     try:
-        image_path, caption, lesson = await asyncio.to_thread(
-            generate_education_image,
+        image_paths, caption, lesson = await asyncio.to_thread(
+            generate_education_images,
             topic,
             draft_dir,
             context.application.bot_data["local_image"],
@@ -377,7 +414,7 @@ async def receive_generated_image_topic(
     draft = {
         "image_id": image_id,
         "user_id": update.effective_user.id,
-        "image_filename": image_path.name,
+        "image_filenames": [path.name for path in image_paths],
         "caption": caption,
         "topic": topic,
         "lesson": lesson,
@@ -399,16 +436,16 @@ async def receive_generated_image_topic(
         ],
         [InlineKeyboardButton("Cancel", callback_data=f"image_cancel:{image_id}")],
     ])
-    with image_path.open("rb") as handle:
-        await update.message.reply_photo(
-            photo=handle,
-            caption=(f"Generated preview: {topic}\n\n{caption}")[:1024],
-            reply_markup=keyboard,
-            read_timeout=300,
-            write_timeout=300,
-        )
+    await send_carousel_preview(
+        context,
+        update.effective_chat.id,
+        image_paths,
+        topic,
+        caption,
+        keyboard,
+    )
     await progress.edit_text(
-        "Preview ready. Check every word before publishing; regenerate if needed."
+        "Carousel preview ready. Check every slide; regenerate if needed."
     )
     context.user_data.clear()
     return ConversationHandler.END
@@ -1237,26 +1274,61 @@ def resolve_page_access_token(config: dict[str, str]) -> str:
     raise RuntimeError("The configured Facebook Page is not managed by this token")
 
 
-def publish_image_to_facebook(image: Path, caption: str, config: dict[str, str]) -> str:
+def publish_images_to_facebook(
+    images: list[Path], caption: str, config: dict[str, str]
+) -> str:
     if not config.get("page_id") or not config.get("access_token"):
         raise RuntimeError(
             "Education Page is not configured. Add IMAGE_FACEBOOK_PAGE_ID and "
             "IMAGE_FACEBOOK_PAGE_ACCESS_TOKEN to .env."
         )
     page_token = resolve_page_access_token(config)
-    endpoint = (
+    photo_endpoint = (
         f"https://graph.facebook.com/{config['graph_version']}/"
         f"{config['page_id']}/photos"
     )
-    with image.open("rb") as handle:
+    if not images:
+        raise RuntimeError("The image draft contains no slides")
+    if len(images) == 1:
+        image = images[0]
+        with image.open("rb") as handle:
+            response = requests.post(
+                photo_endpoint,
+                data={
+                    "access_token": page_token,
+                    "caption": caption,
+                    "published": "true",
+                },
+                files={"source": (image.name, handle, "application/octet-stream")},
+                timeout=(30, 300),
+            )
+    else:
+        media_ids = []
+        for image in images:
+            with image.open("rb") as handle:
+                upload = requests.post(
+                    photo_endpoint,
+                    data={"access_token": page_token, "published": "false"},
+                    files={
+                        "source": (image.name, handle, "application/octet-stream")
+                    },
+                    timeout=(30, 300),
+                )
+            if not upload.ok:
+                raise facebook_error(upload)
+            media_id = str(upload.json().get("id") or "")
+            if not media_id:
+                raise RuntimeError("Facebook uploaded a slide but returned no media ID")
+            media_ids.append(media_id)
         response = requests.post(
-            endpoint,
+            f"https://graph.facebook.com/{config['graph_version']}/{config['page_id']}/feed",
             data={
                 "access_token": page_token,
-                "caption": caption,
-                "published": "true",
+                "message": caption,
+                "attached_media": json.dumps(
+                    [{"media_fbid": media_id} for media_id in media_ids]
+                ),
             },
-            files={"source": (image.name, handle, "application/octet-stream")},
             timeout=(30, 300),
         )
     if not response.ok:
@@ -1289,7 +1361,10 @@ async def image_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         draft = json.loads(
             (draft_dir / "image.json").read_text(encoding="utf-8-sig")
         )
-        image_path = draft_dir / draft["image_filename"]
+        filenames = draft.get("image_filenames") or [draft["image_filename"]]
+        image_paths = [draft_dir / filename for filename in filenames]
+        if not all(path.is_file() for path in image_paths):
+            raise FileNotFoundError("One or more carousel slides are missing")
     except Exception as exc:
         await query.answer(f"Image draft unavailable: {exc}", show_alert=True)
         return
@@ -1305,10 +1380,12 @@ async def image_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if not draft.get("generated") or not draft.get("topic"):
             await query.answer("Only AI-generated drafts can be regenerated.", show_alert=True)
             return
-        progress = await query.message.reply_text("Generating a new visual version…")
+        progress = await query.message.reply_text(
+            "Generating a new 3-to-5-slide lesson. This can take several minutes…"
+        )
         try:
-            image_path, caption, lesson = await asyncio.to_thread(
-                generate_education_image,
+            image_paths, caption, lesson = await asyncio.to_thread(
+                generate_education_images,
                 draft["topic"],
                 draft_dir,
                 context.application.bot_data["local_image"],
@@ -1318,7 +1395,7 @@ async def image_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await progress.edit_text(image_generation_error_message(exc))
             return
         draft.update(
-            image_filename=image_path.name,
+            image_filenames=[path.name for path in image_paths],
             caption=caption,
             lesson=lesson,
             status="ready",
@@ -1339,25 +1416,28 @@ async def image_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             ],
             [InlineKeyboardButton("Cancel", callback_data=f"image_cancel:{image_id}")],
         ])
-        with image_path.open("rb") as handle:
-            await query.message.reply_photo(
-                photo=handle,
-                caption=f"New generated preview: {draft['topic']}",
-                reply_markup=keyboard,
-                read_timeout=300,
-                write_timeout=300,
-            )
+        await send_carousel_preview(
+            context,
+            query.message.chat_id,
+            image_paths,
+            draft["topic"],
+            caption,
+            keyboard,
+            regenerated=True,
+        )
         await query.edit_message_reply_markup(reply_markup=None)
-        await progress.edit_text("New version ready. Check every word before publishing.")
+        await progress.edit_text("New carousel ready. Check every slide before publishing.")
         return
     if draft.get("status") == "published":
         await query.answer("This image is already published.", show_alert=True)
         return
-    progress = await query.message.reply_text("Uploading image to education Page…")
+    progress = await query.message.reply_text(
+        f"Uploading {len(image_paths)} image(s) to the education Page…"
+    )
     try:
         post_url = await asyncio.to_thread(
-            publish_image_to_facebook,
-            image_path,
+            publish_images_to_facebook,
+            image_paths,
             draft["caption"],
             context.application.bot_data["image_facebook"],
         )
