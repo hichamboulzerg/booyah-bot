@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import logging
@@ -48,6 +49,7 @@ from telegram.ext import (
 ) = range(8)
 EDIT_VALUE, SCHEDULE_VALUE = range(20, 22)
 IMAGE_WAIT_PHOTO, IMAGE_WAIT_CAPTION = range(30, 32)
+GENERATE_IMAGE_TOPIC = 40
 TIME_RANGE_RE = re.compile(
     r"^(?P<start>\d{1,3}:\d{2}:\d{2})-(?P<end>\d{1,3}:\d{2}:\d{2})$"
 )
@@ -301,6 +303,162 @@ async def receive_image_caption(
             read_timeout=120,
             write_timeout=120,
         )
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+def generate_education_image(
+    topic: str,
+    draft_dir: Path,
+    ai_config: dict,
+    reference_paths: list[Path],
+) -> tuple[Path, str, str]:
+    client = openai_client(ai_config)
+    lesson_response = client.responses.create(
+        model=ai_config["text_model"],
+        input=(
+            "Create accurate beginner-friendly content for a one-page educational "
+            f"infographic about: {topic}. Return plain text only. Use a short title, "
+            "then 3 or 4 short sections with headings, concise bullets, and one small "
+            "example. Keep the complete text under 220 words. Verify technical facts."
+        ),
+    )
+    lesson = lesson_response.output_text.strip()
+    if not lesson:
+        raise RuntimeError("OpenAI returned empty lesson content")
+    prompt = (
+        "Create a NEW original vertical educational infographic. Use the supplied "
+        "images only as visual style references; do not copy their subject matter. "
+        "Match this visual family: warm white ruled notebook paper, visible spiral "
+        "binding, large blue hand-lettered title, blue ink headings, red underline "
+        "accents, small yellow stars, friendly colored pencil doodles, tidy sections, "
+        "balanced whitespace, highly readable portrait composition. Avoid photorealism. "
+        "Render the following lesson accurately and do not invent extra facts or words:\n\n"
+        + lesson
+    )
+    handles = [path.open("rb") for path in reference_paths if path.exists()]
+    try:
+        if handles:
+            result = client.images.edit(
+                model=ai_config["image_model"],
+                image=handles,
+                prompt=prompt,
+                size="1024x1536",
+                quality=ai_config["image_quality"],
+                output_format="png",
+            )
+        else:
+            result = client.images.generate(
+                model=ai_config["image_model"],
+                prompt=prompt,
+                size="1024x1536",
+                quality=ai_config["image_quality"],
+                output_format="png",
+            )
+    finally:
+        for handle in handles:
+            handle.close()
+    encoded = result.data[0].b64_json
+    if not encoded:
+        raise RuntimeError("OpenAI returned no generated image")
+    image_path = draft_dir / "generated.png"
+    image_path.write_bytes(base64.b64decode(encoded))
+    caption = f"📘 {topic}\n\nSave this visual guide for later."
+    return image_path, caption, lesson
+
+
+def image_generation_error_message(exc: Exception) -> str:
+    text = str(exc)
+    if "credit_balance_exhausted" in text or "no credits remaining" in text.lower():
+        return (
+            "OpenAI API credits are empty. Add credits in the OpenAI Platform "
+            "billing page, then run /create_image again."
+        )
+    if "organization_verification" in text.lower():
+        return "OpenAI organization verification is required for image generation."
+    return f"Image generation failed: {text[:500]}"
+
+
+async def create_image_start(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    if not await authorized(update, context):
+        return ConversationHandler.END
+    if not context.application.bot_data["openai"]["api_key"]:
+        await update.message.reply_text("Add OPENAI_API_KEY to .env first.")
+        return ConversationHandler.END
+    context.user_data.clear()
+    await update.message.reply_text(
+        "Send an educational topic, for example: Python lists, DNS explained, "
+        "or 20 useful Windows shortcuts."
+    )
+    return GENERATE_IMAGE_TOPIC
+
+
+async def receive_generated_image_topic(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    if not await authorized(update, context):
+        return ConversationHandler.END
+    topic = update.message.text.strip()[:160]
+    if not topic:
+        await update.message.reply_text("The topic cannot be empty.")
+        return GENERATE_IMAGE_TOPIC
+    progress = await update.message.reply_text(
+        "Writing the lesson and generating the notebook-style image…"
+    )
+    image_id = uuid.uuid4().hex
+    draft_dir = image_draft_path(context.application.bot_data["image_root"], image_id)
+    draft_dir.mkdir(parents=True, exist_ok=False)
+    try:
+        image_path, caption, lesson = await asyncio.to_thread(
+            generate_education_image,
+            topic,
+            draft_dir,
+            context.application.bot_data["openai"],
+            context.application.bot_data["image_style_references"],
+        )
+    except Exception as exc:
+        shutil.rmtree(draft_dir, ignore_errors=True)
+        LOGGER.exception("Education image generation failed")
+        await progress.edit_text(image_generation_error_message(exc))
+        return ConversationHandler.END
+    draft = {
+        "image_id": image_id,
+        "user_id": update.effective_user.id,
+        "image_filename": image_path.name,
+        "caption": caption,
+        "topic": topic,
+        "lesson": lesson,
+        "generated": True,
+        "status": "ready",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    (draft_dir / "image.json").write_text(
+        json.dumps(draft, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "Publish to education Page", callback_data=f"image_publish:{image_id}"
+            ),
+            InlineKeyboardButton(
+                "Regenerate", callback_data=f"image_regenerate:{image_id}"
+            ),
+        ],
+        [InlineKeyboardButton("Cancel", callback_data=f"image_cancel:{image_id}")],
+    ])
+    with image_path.open("rb") as handle:
+        await update.message.reply_photo(
+            photo=handle,
+            caption=(f"Generated preview: {topic}\n\n{caption}")[:1024],
+            reply_markup=keyboard,
+            read_timeout=300,
+            write_timeout=300,
+        )
+    await progress.edit_text(
+        "Preview ready. Check every word before publishing; regenerate if needed."
+    )
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -1191,6 +1349,56 @@ async def image_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         shutil.rmtree(draft_dir, ignore_errors=True)
         await query.edit_message_reply_markup(reply_markup=None)
         await query.message.reply_text("Image post cancelled and cached image deleted.")
+        return
+    if action == "image_regenerate":
+        if not draft.get("generated") or not draft.get("topic"):
+            await query.answer("Only AI-generated drafts can be regenerated.", show_alert=True)
+            return
+        progress = await query.message.reply_text("Generating a new visual version…")
+        try:
+            image_path, caption, lesson = await asyncio.to_thread(
+                generate_education_image,
+                draft["topic"],
+                draft_dir,
+                context.application.bot_data["openai"],
+                context.application.bot_data["image_style_references"],
+            )
+        except Exception as exc:
+            LOGGER.exception("Education image regeneration failed")
+            await progress.edit_text(image_generation_error_message(exc))
+            return
+        draft.update(
+            image_filename=image_path.name,
+            caption=caption,
+            lesson=lesson,
+            status="ready",
+            last_error="",
+        )
+        (draft_dir / "image.json").write_text(
+            json.dumps(draft, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "Publish to education Page",
+                    callback_data=f"image_publish:{image_id}",
+                ),
+                InlineKeyboardButton(
+                    "Regenerate", callback_data=f"image_regenerate:{image_id}"
+                ),
+            ],
+            [InlineKeyboardButton("Cancel", callback_data=f"image_cancel:{image_id}")],
+        ])
+        with image_path.open("rb") as handle:
+            await query.message.reply_photo(
+                photo=handle,
+                caption=f"New generated preview: {draft['topic']}",
+                reply_markup=keyboard,
+                read_timeout=300,
+                write_timeout=300,
+            )
+        await query.edit_message_reply_markup(reply_markup=None)
+        await progress.edit_text("New version ready. Check every word before publishing.")
         return
     if draft.get("status") == "published":
         await query.answer("This image is already published.", show_alert=True)
@@ -2200,6 +2408,13 @@ def main() -> None:
     download_root.mkdir(parents=True, exist_ok=True)
     image_root = download_root / "images"
     image_root.mkdir(parents=True, exist_ok=True)
+    style_reference_dir = base_dir / os.getenv(
+        "IMAGE_STYLE_REFERENCE_DIR", "assets/style-references"
+    )
+    image_style_references = sorted(
+        path for path in style_reference_dir.glob("*")
+        if path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}
+    )[:4]
     state_db = base_dir / os.getenv("STATE_DB", "bot_state.db")
     init_state_db(state_db)
 
@@ -2218,6 +2433,7 @@ def main() -> None:
         preview_max_bytes=int(os.getenv("TELEGRAM_PREVIEW_MAX_MB", "45")) * 1024 * 1024,
         download_root=download_root,
         image_root=image_root,
+        image_style_references=image_style_references,
         state_db=state_db,
         schedule_timezone=os.getenv("SCHEDULE_TIMEZONE", "UTC").strip(),
         draft_retention_days=int(os.getenv("DRAFT_RETENTION_DAYS", "14")),
@@ -2245,6 +2461,8 @@ def main() -> None:
             "text_model": os.getenv("OPENAI_TEXT_MODEL", "gpt-4.1-mini").strip(),
             "transcribe_model": os.getenv("OPENAI_TRANSCRIBE_MODEL", "whisper-1").strip(),
             "max_minutes": int(os.getenv("AI_HIGHLIGHT_MAX_MINUTES", "60")),
+            "image_model": os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-2").strip(),
+            "image_quality": os.getenv("OPENAI_IMAGE_QUALITY", "medium").strip(),
         },
     )
 
@@ -2282,6 +2500,18 @@ def main() -> None:
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     application.add_handler(image_conversation)
+    generated_image_conversation = ConversationHandler(
+        entry_points=[CommandHandler("create_image", create_image_start)],
+        states={
+            GENERATE_IMAGE_TOPIC: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND, receive_generated_image_topic
+                )
+            ]
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+    application.add_handler(generated_image_conversation)
     edit_conversation = ConversationHandler(
         entry_points=[
             CallbackQueryHandler(
@@ -2336,7 +2566,8 @@ def main() -> None:
     )
     application.add_handler(
         CallbackQueryHandler(
-            image_action, pattern=r"^image_(publish|cancel):[a-f0-9]{32}$"
+            image_action,
+            pattern=r"^image_(publish|regenerate|cancel):[a-f0-9]{32}$",
         )
     )
     application.add_handler(CommandHandler("cancel", cancel))
