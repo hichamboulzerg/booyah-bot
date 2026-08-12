@@ -33,6 +33,11 @@ try {
         throw "git commit failed"
     }
 
+    git pull --rebase origin main
+    if ($LASTEXITCODE -ne 0) {
+        throw "git pull --rebase failed; resolve the repository conflict manually"
+    }
+
     git push origin main
     if ($LASTEXITCODE -ne 0) {
         throw "git push failed"
