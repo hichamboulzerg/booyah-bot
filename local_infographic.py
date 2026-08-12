@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import textwrap
 from pathlib import Path
 
@@ -203,6 +204,30 @@ def generate_carousel_lesson(topic: str, endpoint: str, model: str) -> dict:
         raise RuntimeError("The local model did not return 3 to 5 complete slides")
     if not all(slide["example"] for slide in slides):
         raise RuntimeError("The local model omitted a required practical example")
+    all_headings = [
+        point["heading"].casefold()
+        for slide in slides
+        for point in slide["points"]
+    ]
+    if len(all_headings) != len(set(all_headings)):
+        raise RuntimeError("The local model repeated a teaching-point heading")
+    all_explanations = [
+        point["explanation"].casefold()
+        for slide in slides
+        for point in slide["points"]
+    ]
+    if len(all_explanations) != len(set(all_explanations)):
+        raise RuntimeError("The local model repeated an explanation")
+    combined = " ".join(
+        all_explanations + [slide["example"].casefold() for slide in slides]
+    )
+    temporary_patterns = (
+        r"\bcurrent price\b",
+        r"\blatest version\b",
+        r"\b(?:\d{1,3}\.){3}\d{1,3}\b",
+    )
+    if any(re.search(pattern, combined) for pattern in temporary_patterns):
+        raise RuntimeError("The local model used a temporary fact or live IP address")
     return {
         "title": _clean(payload.get("title") or topic, 55),
         "caption": _clean(

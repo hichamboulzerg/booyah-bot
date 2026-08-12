@@ -23,10 +23,17 @@ from zoneinfo import ZoneInfo
 
 import imageio_ffmpeg
 import requests
+import growth_tools as growth
 from local_infographic import create_carousel
 from requests_toolbelt import MultipartEncoder, MultipartEncoderMonitor
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+    Update,
+)
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -162,6 +169,7 @@ def init_state_db(path: Path) -> None:
             )
             """
         )
+    growth.init_growth_db(path)
 
 
 def record_published(state_db: Path, job: dict, post_url: str) -> None:
@@ -183,6 +191,13 @@ def record_published(state_db: Path, job: dict, post_url: str) -> None:
                 datetime.now(timezone.utc).isoformat(),
             ),
         )
+    growth.record_content(
+        state_db,
+        "booyah",
+        job.get("headline") or job.get("caption") or "Untitled video",
+        "video",
+        post_url,
+    )
 
 
 def duplicate_reason(
@@ -445,7 +460,8 @@ async def receive_generated_image_topic(
         keyboard,
     )
     await progress.edit_text(
-        "Carousel preview ready. Check every slide; regenerate if needed."
+        "Carousel preview ready. Check every slide; regenerate if needed.\n\n"
+        + growth.quality_report(draft, draft_dir)
     )
     context.user_data.clear()
     return ConversationHandler.END
@@ -1225,7 +1241,8 @@ async def send_job_preview(
         f"Preview ready\n\nHeadline: {job['headline']}\n"
         f"Layout: {LAYOUTS.get(job.get('layout'), job.get('layout', ''))}\n"
         f"Template: {BRAND_TEMPLATES.get(job.get('template'), {}).get('name', '')}\n"
-        f"Post caption: {job['caption']}{preview_note}"
+        f"Post caption: {job['caption']}{preview_note}\n\n"
+        f"{growth.originality_report(job)}"
     )[:1000]
     keyboard = job_keyboard(job["job_id"])
     if preview.stat().st_size <= max_bytes:
@@ -1458,6 +1475,13 @@ async def image_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         json.dumps(draft, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     await query.edit_message_reply_markup(reply_markup=None)
+    growth.record_content(
+        context.application.bot_data["state_db"],
+        "study",
+        draft.get("topic") or draft.get("caption") or "Visual lesson",
+        "carousel" if len(image_paths) > 1 else "image",
+        post_url,
+    )
     await progress.edit_text(f"Image published successfully.\n{post_url}")
 
 
@@ -2204,6 +2228,395 @@ async def facebook_status_command(
     )
 
 
+def growth_page_configs(context: ContextTypes.DEFAULT_TYPE | Application) -> dict:
+    bot_data = context.bot_data if isinstance(context, Application) else context.application.bot_data
+    return {"booyah": bot_data["facebook"], "study": bot_data["image_facebook"]}
+
+
+async def collect_growth_snapshots(context: ContextTypes.DEFAULT_TYPE) -> list[dict]:
+    configs = growth_page_configs(context)
+    return await asyncio.gather(
+        *[
+            asyncio.to_thread(growth.fetch_page_snapshot, key, config, 7)
+            for key, config in configs.items()
+        ]
+    )
+
+
+async def cmd_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await authorized(update, context):
+        return
+    await update.message.reply_text(
+        "🤖 Bot commands\n\n"
+        "CREATE & PUBLISH\n"
+        "/start — create a Booyah video\n"
+        "/create_image — create a Study Sketch carousel\n"
+        "/image — upload your own image\n"
+        "/repurpose — turn the latest carousel into a Reel\n"
+        "/repurpose booyah — create companion gaming posts\n\n"
+        "GROWTH\n"
+        "/stats — live seven-day Page statistics\n"
+        "/weekly_report — winners and next actions\n"
+        "/content_plan — seven-day plan for both Pages\n"
+        "/hooks booyah|study topic — two hook variants\n"
+        "/series — recent topic memory\n"
+        "/quality — audit the latest carousel\n"
+        "/originality — audit the latest video draft\n"
+        "/comments — review suggested comment replies\n"
+        "/alerts — check growth opportunities now\n\n"
+        "OPERATIONS\n"
+        "/drafts — cached video drafts\n"
+        "/queue — scheduled posts\n"
+        "/storage — cache size\n"
+        "/cleanup — remove expired drafts\n"
+        "/facebook_status — token and Page health\n"
+        "/cancel — cancel the current workflow\n"
+        "/cmd — show this command list"
+    )
+
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await authorized(update, context):
+        return
+    progress = await update.message.reply_text("Reading both Pages' live statistics…")
+    try:
+        snapshots = await collect_growth_snapshots(context)
+        for snapshot in snapshots:
+            await asyncio.to_thread(
+                growth.store_snapshot, context.application.bot_data["state_db"], snapshot
+            )
+    except Exception as exc:
+        LOGGER.exception("Growth statistics failed")
+        await progress.edit_text(f"Statistics failed: {exc}")
+        return
+    await progress.edit_text(growth.format_stats(snapshots))
+
+
+async def weekly_report_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    if not await authorized(update, context):
+        return
+    progress = await update.message.reply_text("Analyzing the last seven days…")
+    try:
+        snapshots = await collect_growth_snapshots(context)
+        for snapshot in snapshots:
+            await asyncio.to_thread(
+                growth.store_snapshot, context.application.bot_data["state_db"], snapshot
+            )
+    except Exception as exc:
+        LOGGER.exception("Weekly growth report failed")
+        await progress.edit_text(f"Weekly report failed: {exc}")
+        return
+    await progress.edit_text(growth.weekly_report(snapshots))
+
+
+async def content_plan_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    if not await authorized(update, context):
+        return
+    progress = await update.message.reply_text(
+        "Building a seven-day plan from both Pages' performance. The local model can "
+        "take several minutes…"
+    )
+    try:
+        snapshots = await collect_growth_snapshots(context)
+        topics = await asyncio.to_thread(
+            growth.recent_topics, context.application.bot_data["state_db"]
+        )
+        plan = await asyncio.to_thread(
+            growth.create_content_plan,
+            context.application.bot_data["local_image"],
+            snapshots,
+            topics,
+        )
+    except Exception as exc:
+        LOGGER.exception("Content plan generation failed")
+        await progress.edit_text(f"Content plan failed: {exc}")
+        return
+    await progress.edit_text(plan)
+
+
+async def hooks_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await authorized(update, context):
+        return
+    args = list(context.args)
+    page_key = "booyah"
+    if args and args[0].lower() in {"booyah", "study"}:
+        page_key = args.pop(0).lower()
+    topic = " ".join(args).strip()
+    if not topic:
+        await update.message.reply_text(
+            "Use /hooks booyah your topic or /hooks study your topic"
+        )
+        return
+    progress = await update.message.reply_text("Creating two honest hook variants…")
+    try:
+        hook_a, hook_b = await asyncio.to_thread(
+            growth.create_hooks,
+            context.application.bot_data["local_image"],
+            topic[:200],
+            page_key,
+        )
+        experiment_id = await asyncio.to_thread(
+            growth.save_hook_experiment,
+            context.application.bot_data["state_db"],
+            page_key,
+            topic[:200],
+            hook_a,
+            hook_b,
+        )
+    except Exception as exc:
+        LOGGER.exception("Hook generation failed")
+        await progress.edit_text(f"Hook generation failed: {exc}")
+        return
+    keyboard = InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton(
+                "Mark A winner", callback_data=f"hook_winner:{experiment_id}:A"
+            ),
+            InlineKeyboardButton(
+                "Mark B winner", callback_data=f"hook_winner:{experiment_id}:B"
+            ),
+        ]]
+    )
+    await progress.edit_text(
+        f"🧪 Hook experiment {experiment_id}\n"
+        f"Page: {growth.PAGE_LABELS[page_key]}\n\n"
+        f"A — Curiosity\n{hook_a}\n\n"
+        f"B — Benefit\n{hook_b}\n\n"
+        "Use each on comparable posts. Judge by reach, watch time, shares and follows—not likes alone.",
+        reply_markup=keyboard,
+    )
+
+
+async def hook_winner_action(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    if not await authorized(update, context):
+        return
+    query = update.callback_query
+    _, experiment_id, winner = query.data.split(":", 2)
+    await query.answer()
+    try:
+        await asyncio.to_thread(
+            growth.mark_hook_winner,
+            context.application.bot_data["state_db"],
+            experiment_id,
+            winner,
+        )
+    except Exception as exc:
+        await query.answer(str(exc), show_alert=True)
+        return
+    await query.edit_message_reply_markup(reply_markup=None)
+    await query.message.reply_text(f"Hook {winner} recorded as the winner.")
+
+
+async def series_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await authorized(update, context):
+        return
+    text = await asyncio.to_thread(
+        growth.format_series, context.application.bot_data["state_db"]
+    )
+    await update.message.reply_text(text)
+
+
+async def quality_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await authorized(update, context):
+        return
+    latest = await asyncio.to_thread(
+        growth.latest_image_draft,
+        context.application.bot_data["image_root"],
+        update.effective_user.id,
+    )
+    if not latest:
+        await update.message.reply_text("No generated carousel draft is available.")
+        return
+    draft_dir, draft = latest
+    await update.message.reply_text(growth.quality_report(draft, draft_dir))
+
+
+async def originality_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    if not await authorized(update, context):
+        return
+    jobs = [
+        item
+        for item in cached_jobs(context.application.bot_data["download_root"])
+        if item[1].get("user_id") == update.effective_user.id
+    ]
+    if not jobs:
+        await update.message.reply_text("No cached Booyah video draft is available.")
+        return
+    await update.message.reply_text(growth.originality_report(jobs[0][1]))
+
+
+async def repurpose_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    if not await authorized(update, context):
+        return
+    if context.args and context.args[0].lower() == "booyah":
+        jobs = [
+            item
+            for item in cached_jobs(context.application.bot_data["download_root"])
+            if item[1].get("user_id") == update.effective_user.id
+        ]
+        if not jobs:
+            await update.message.reply_text("No cached Booyah draft is available.")
+            return
+        progress = await update.message.reply_text(
+            "Creating original companion content from the latest Booyah draft…"
+        )
+        try:
+            companions = await asyncio.to_thread(
+                growth.create_booyah_companions,
+                context.application.bot_data["local_image"],
+                jobs[0][1],
+            )
+        except Exception as exc:
+            LOGGER.exception("Booyah repurpose failed")
+            await progress.edit_text(f"Repurpose failed: {exc}")
+            return
+        await progress.edit_text(companions)
+        return
+    latest = await asyncio.to_thread(
+        growth.latest_image_draft,
+        context.application.bot_data["image_root"],
+        update.effective_user.id,
+    )
+    if not latest:
+        await update.message.reply_text(
+            "Create a Study Sketch carousel first with /create_image."
+        )
+        return
+    draft_dir, draft = latest
+    progress = await update.message.reply_text("Turning the latest carousel into a Reel…")
+    output = draft_dir / "repurposed-reel.mp4"
+    try:
+        await asyncio.to_thread(
+            growth.build_slideshow_reel,
+            draft_dir,
+            draft,
+            imageio_ffmpeg.get_ffmpeg_exe(),
+            output,
+        )
+    except Exception as exc:
+        LOGGER.exception("Carousel repurpose failed")
+        await progress.edit_text(f"Repurpose failed: {exc}")
+        return
+    with output.open("rb") as handle:
+        await update.message.reply_video(
+            video=handle,
+            caption=(
+                f"Repurposed Study Sketch Reel: {draft.get('topic', 'Visual lesson')}\n"
+                "Review it before uploading. Add narration or music in Facebook for a stronger result."
+            )[:1024],
+            supports_streaming=True,
+            read_timeout=300,
+            write_timeout=300,
+        )
+    await progress.edit_text("Repurposed Reel ready.")
+
+
+async def comments_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await authorized(update, context):
+        return
+    progress = await update.message.reply_text("Checking recent comments on both Pages…")
+    try:
+        comments = await asyncio.to_thread(
+            growth.fetch_recent_comments, growth_page_configs(context), 8
+        )
+        if not comments:
+            await progress.edit_text("There are no recent comments needing a reply.")
+            return
+        await progress.edit_text(
+            "Writing reply suggestions locally. Nothing will be posted without approval…"
+        )
+        replies = await asyncio.to_thread(
+            growth.suggest_comment_replies,
+            context.application.bot_data["local_image"],
+            comments,
+        )
+    except Exception as exc:
+        LOGGER.exception("Comment assistant failed")
+        await progress.edit_text(f"Comment assistant failed: {exc}")
+        return
+    await progress.edit_text(f"Prepared {min(len(comments), len(replies))} suggestion(s).")
+    for comment, reply in zip(comments, replies):
+        suggestion_id = await asyncio.to_thread(
+            growth.save_comment_suggestion,
+            context.application.bot_data["state_db"],
+            comment,
+            reply,
+        )
+        keyboard = InlineKeyboardMarkup(
+            [[
+                InlineKeyboardButton(
+                    "✅ Post reply", callback_data=f"comment_approve:{suggestion_id}"
+                ),
+                InlineKeyboardButton(
+                    "Skip", callback_data=f"comment_skip:{suggestion_id}"
+                ),
+            ]]
+        )
+        await update.message.reply_text(
+            f"{growth.PAGE_LABELS[comment['page_key']]}\n"
+            f"{comment['author']}: {comment['message']}\n\n"
+            f"Suggested reply:\n{reply}",
+            reply_markup=keyboard,
+        )
+
+
+async def comment_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await authorized(update, context):
+        return
+    query = update.callback_query
+    action, suggestion_id = query.data.split(":", 1)
+    await query.answer()
+    try:
+        status = await asyncio.to_thread(
+            growth.act_on_comment_suggestion,
+            context.application.bot_data["state_db"],
+            suggestion_id,
+            action == "comment_approve",
+            growth_page_configs(context),
+        )
+    except Exception as exc:
+        await query.answer(str(exc)[:180], show_alert=True)
+        return
+    await query.edit_message_reply_markup(reply_markup=None)
+    await query.message.reply_text(
+        "Reply posted." if status == "posted" else "Reply suggestion skipped."
+    )
+
+
+async def alerts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await authorized(update, context):
+        return
+    progress = await update.message.reply_text("Checking for growth opportunities…")
+    try:
+        snapshots = await collect_growth_snapshots(context)
+        for snapshot in snapshots:
+            await asyncio.to_thread(
+                growth.store_snapshot, context.application.bot_data["state_db"], snapshot
+            )
+        alerts = growth.growth_alerts(
+            context.application.bot_data["state_db"], snapshots
+        )
+    except Exception as exc:
+        LOGGER.exception("Growth alerts failed")
+        await progress.edit_text(f"Growth alert check failed: {exc}")
+        return
+    await progress.edit_text(
+        "🔔 Growth opportunities\n\n" + "\n\n".join(alerts)
+        if alerts
+        else "No urgent growth alert. Continue the current tests and check again tomorrow."
+    )
+
+
 async def maintenance_worker(application: Application) -> None:
     last_token_check = 0.0
     last_cleanup = 0.0
@@ -2314,7 +2727,53 @@ async def scheduled_worker(application: Application) -> None:
         await asyncio.sleep(30)
 
 
+async def growth_worker(application: Application) -> None:
+    await asyncio.sleep(60)
+    last_messages: set[str] = set()
+    while True:
+        try:
+            configs = growth_page_configs(application)
+            snapshots = await asyncio.gather(
+                *[
+                    asyncio.to_thread(growth.fetch_page_snapshot, key, config, 7)
+                    for key, config in configs.items()
+                ]
+            )
+            for snapshot in snapshots:
+                await asyncio.to_thread(
+                    growth.store_snapshot, application.bot_data["state_db"], snapshot
+                )
+            messages = set(
+                growth.growth_alerts(application.bot_data["state_db"], snapshots)
+            )
+            for message in sorted(messages - last_messages):
+                for user_id in application.bot_data["allowed_users"]:
+                    await application.bot.send_message(
+                        chat_id=user_id, text=f"🔔 Growth alert\n\n{message}"
+                    )
+            last_messages = messages
+        except Exception:
+            LOGGER.exception("Automatic growth check failed")
+        await asyncio.sleep(application.bot_data["growth_check_interval"])
+
+
 async def post_init(application: Application) -> None:
+    await application.bot.set_my_commands(
+        [
+            BotCommand("cmd", "Show every command"),
+            BotCommand("start", "Create a Booyah video"),
+            BotCommand("create_image", "Create a Study Sketch carousel"),
+            BotCommand("stats", "View both Pages' growth statistics"),
+            BotCommand("weekly_report", "Get weekly winners and actions"),
+            BotCommand("content_plan", "Build a seven-day content plan"),
+            BotCommand("hooks", "Create two hook variants"),
+            BotCommand("repurpose", "Turn the latest carousel into a Reel"),
+            BotCommand("comments", "Review suggested comment replies"),
+            BotCommand("alerts", "Check growth opportunities"),
+            BotCommand("drafts", "Open cached video drafts"),
+            BotCommand("queue", "View scheduled posts"),
+        ]
+    )
     application.bot_data["background_tasks"] = [
         asyncio.create_task(
             scheduled_worker(application), name="scheduled-publisher"
@@ -2322,6 +2781,7 @@ async def post_init(application: Application) -> None:
         asyncio.create_task(
             maintenance_worker(application), name="maintenance-worker"
         ),
+        asyncio.create_task(growth_worker(application), name="growth-worker"),
     ]
 
 
@@ -2462,6 +2922,7 @@ def main() -> None:
         failed_retention_days=int(os.getenv("FAILED_RETENTION_DAYS", "30")),
         cleanup_interval=int(os.getenv("CLEANUP_INTERVAL_SECONDS", "3600")),
         token_check_interval=int(os.getenv("TOKEN_CHECK_INTERVAL_SECONDS", "21600")),
+        growth_check_interval=int(os.getenv("GROWTH_CHECK_INTERVAL_SECONDS", "21600")),
         logo_path=base_dir / os.getenv("LOGO_PATH", "assets/logo.png"),
         watermark_text=os.getenv("WATERMARK_TEXT", "Booyah King").strip(),
         facebook={
@@ -2602,6 +3063,27 @@ def main() -> None:
     application.add_handler(CommandHandler("storage", storage_command))
     application.add_handler(CommandHandler("cleanup", cleanup_command))
     application.add_handler(CommandHandler("facebook_status", facebook_status_command))
+    application.add_handler(CommandHandler("cmd", cmd_command))
+    application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("weekly_report", weekly_report_command))
+    application.add_handler(CommandHandler("content_plan", content_plan_command))
+    application.add_handler(CommandHandler("hooks", hooks_command))
+    application.add_handler(CommandHandler("series", series_command))
+    application.add_handler(CommandHandler("quality", quality_command))
+    application.add_handler(CommandHandler("originality", originality_command))
+    application.add_handler(CommandHandler("repurpose", repurpose_command))
+    application.add_handler(CommandHandler("comments", comments_command))
+    application.add_handler(CommandHandler("alerts", alerts_command))
+    application.add_handler(
+        CallbackQueryHandler(
+            hook_winner_action, pattern=r"^hook_winner:[a-f0-9]{10}:[AB]$"
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            comment_action, pattern=r"^comment_(approve|skip):[a-f0-9]{12}$"
+        )
+    )
     application.add_handler(
         CallbackQueryHandler(open_draft, pattern=r"^draft_open:[a-f0-9]{32}$")
     )

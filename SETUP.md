@@ -72,4 +72,9 @@ Use Task Scheduler to run `.venv\Scripts\python.exe` with `bot.py` as the argume
 - Duplicate source/range combinations are blocked across drafts and published history. Prefix a range request with `force:` to intentionally override the warning.
 - `/storage` reports cached disk usage; `/cleanup` removes only drafts older than their configured retention. Scheduled and uploading jobs are preserved.
 - Automatic cleanup uses `DRAFT_RETENTION_DAYS` and `FAILED_RETENTION_DAYS`.
+- `/cmd` shows the complete Telegram command center.
+- `/stats`, `/weekly_report`, and `/alerts` monitor both Facebook Pages. Automatic growth checks use `GROWTH_CHECK_INTERVAL_SECONDS` (six hours by default).
+- `/content_plan` builds a seven-day plan; `/hooks` creates A/B openings; `/series` shows remembered topics.
+- `/quality` checks the latest Study Sketch carousel; `/originality` warns about weakly transformed Booyah drafts.
+- `/repurpose` turns the latest Study Sketch carousel into a vertical video. `/comments` prepares Page replies and posts them only after Telegram approval.
 - `/cancel` ends the active conversation.
