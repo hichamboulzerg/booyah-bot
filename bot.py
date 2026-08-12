@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import hashlib
 import json
 import logging
@@ -24,6 +23,7 @@ from zoneinfo import ZoneInfo
 
 import imageio_ffmpeg
 import requests
+from local_infographic import create_infographic
 from requests_toolbelt import MultipartEncoder, MultipartEncoderMonitor
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -310,82 +310,34 @@ async def receive_image_caption(
 def generate_education_image(
     topic: str,
     draft_dir: Path,
-    ai_config: dict,
-    reference_paths: list[Path],
+    local_config: dict,
 ) -> tuple[Path, str, str]:
-    client = openai_client(ai_config)
-    lesson_response = client.responses.create(
-        model=ai_config["text_model"],
-        input=(
-            "Create accurate beginner-friendly content for a one-page educational "
-            f"infographic about: {topic}. Return plain text only. Use a short title, "
-            "then 3 or 4 short sections with headings, concise bullets, and one small "
-            "example. Keep the complete text under 220 words. Verify technical facts."
-        ),
-    )
-    lesson = lesson_response.output_text.strip()
-    if not lesson:
-        raise RuntimeError("OpenAI returned empty lesson content")
-    prompt = (
-        "Create a NEW original vertical educational infographic. Use the supplied "
-        "images only as visual style references; do not copy their subject matter. "
-        "Match this visual family: warm white ruled notebook paper, visible spiral "
-        "binding, large blue hand-lettered title, blue ink headings, red underline "
-        "accents, small yellow stars, friendly colored pencil doodles, tidy sections, "
-        "balanced whitespace, highly readable portrait composition. Avoid photorealism. "
-        "Render the following lesson accurately and do not invent extra facts or words:\n\n"
-        + lesson
-    )
-    handles = [path.open("rb") for path in reference_paths if path.exists()]
-    try:
-        if handles:
-            result = client.images.edit(
-                model=ai_config["image_model"],
-                image=handles,
-                prompt=prompt,
-                size="1024x1536",
-                quality=ai_config["image_quality"],
-                output_format="png",
-            )
-        else:
-            result = client.images.generate(
-                model=ai_config["image_model"],
-                prompt=prompt,
-                size="1024x1536",
-                quality=ai_config["image_quality"],
-                output_format="png",
-            )
-    finally:
-        for handle in handles:
-            handle.close()
-    encoded = result.data[0].b64_json
-    if not encoded:
-        raise RuntimeError("OpenAI returned no generated image")
     image_path = draft_dir / "generated.png"
-    image_path.write_bytes(base64.b64decode(encoded))
-    caption = f"📘 {topic}\n\nSave this visual guide for later."
+    caption, lesson = create_infographic(
+        topic,
+        image_path,
+        local_config["endpoint"],
+        local_config["model"],
+    )
     return image_path, caption, lesson
 
 
 def image_generation_error_message(exc: Exception) -> str:
     text = str(exc)
-    if "credit_balance_exhausted" in text or "no credits remaining" in text.lower():
+    if "connection" in text.lower() or "11434" in text:
         return (
-            "OpenAI API credits are empty. Add credits in the OpenAI Platform "
-            "billing page, then run /create_image again."
+            "The local Ollama service is unavailable. Start Ollama, then run "
+            "/create_image again."
         )
-    if "organization_verification" in text.lower():
-        return "OpenAI organization verification is required for image generation."
-    return f"Image generation failed: {text[:500]}"
+    if "404" in text or "not found" in text.lower():
+        return "The configured local Ollama model is not installed."
+    return f"Local image generation failed: {text[:500]}"
 
 
 async def create_image_start(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> int:
     if not await authorized(update, context):
-        return ConversationHandler.END
-    if not context.application.bot_data["openai"]["api_key"]:
-        await update.message.reply_text("Add OPENAI_API_KEY to .env first.")
         return ConversationHandler.END
     context.user_data.clear()
     await update.message.reply_text(
@@ -415,8 +367,7 @@ async def receive_generated_image_topic(
             generate_education_image,
             topic,
             draft_dir,
-            context.application.bot_data["openai"],
-            context.application.bot_data["image_style_references"],
+            context.application.bot_data["local_image"],
         )
     except Exception as exc:
         shutil.rmtree(draft_dir, ignore_errors=True)
@@ -1360,8 +1311,7 @@ async def image_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 generate_education_image,
                 draft["topic"],
                 draft_dir,
-                context.application.bot_data["openai"],
-                context.application.bot_data["image_style_references"],
+                context.application.bot_data["local_image"],
             )
         except Exception as exc:
             LOGGER.exception("Education image regeneration failed")
@@ -2408,13 +2358,6 @@ def main() -> None:
     download_root.mkdir(parents=True, exist_ok=True)
     image_root = download_root / "images"
     image_root.mkdir(parents=True, exist_ok=True)
-    style_reference_dir = base_dir / os.getenv(
-        "IMAGE_STYLE_REFERENCE_DIR", "assets/style-references"
-    )
-    image_style_references = sorted(
-        path for path in style_reference_dir.glob("*")
-        if path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}
-    )[:4]
     state_db = base_dir / os.getenv("STATE_DB", "bot_state.db")
     init_state_db(state_db)
 
@@ -2433,7 +2376,6 @@ def main() -> None:
         preview_max_bytes=int(os.getenv("TELEGRAM_PREVIEW_MAX_MB", "45")) * 1024 * 1024,
         download_root=download_root,
         image_root=image_root,
-        image_style_references=image_style_references,
         state_db=state_db,
         schedule_timezone=os.getenv("SCHEDULE_TIMEZONE", "UTC").strip(),
         draft_retention_days=int(os.getenv("DRAFT_RETENTION_DAYS", "14")),
@@ -2456,13 +2398,17 @@ def main() -> None:
             ).strip(),
             "graph_version": os.getenv("FACEBOOK_GRAPH_VERSION", "v23.0").strip(),
         },
+        local_image={
+            "endpoint": os.getenv(
+                "OLLAMA_ENDPOINT", "http://127.0.0.1:11434"
+            ).strip(),
+            "model": os.getenv("OLLAMA_MODEL", "llama3.1:8b").strip(),
+        },
         openai={
             "api_key": os.getenv("OPENAI_API_KEY", "").strip(),
             "text_model": os.getenv("OPENAI_TEXT_MODEL", "gpt-4.1-mini").strip(),
             "transcribe_model": os.getenv("OPENAI_TRANSCRIBE_MODEL", "whisper-1").strip(),
             "max_minutes": int(os.getenv("AI_HIGHLIGHT_MAX_MINUTES", "60")),
-            "image_model": os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-2").strip(),
-            "image_quality": os.getenv("OPENAI_IMAGE_QUALITY", "medium").strip(),
         },
     )
 

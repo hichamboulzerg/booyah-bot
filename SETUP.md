@@ -29,9 +29,8 @@ Edit `.env` and set:
 - `FACEBOOK_PAGE_ACCESS_TOKEN`: long-lived Page access token with the permissions required to publish Page videos.
 - `IMAGE_FACEBOOK_PAGE_ID`: ID of the separate education Page used by `/image`.
 - `IMAGE_FACEBOOK_PAGE_ACCESS_TOKEN`: access token for that education Page. Keep it separate so images can never be sent to the video Page accidentally.
-- `OPENAI_IMAGE_MODEL`: image model used by `/create_image` (default `gpt-image-2`).
-- `OPENAI_IMAGE_QUALITY`: `low`, `medium`, or `high`; `medium` is the default.
-- `IMAGE_STYLE_REFERENCE_DIR`: folder containing up to four notebook-style reference images.
+- `OLLAMA_ENDPOINT`: local Ollama server used by `/create_image`.
+- `OLLAMA_MODEL`: local lesson-writing model (default `llama3.1:8b`). The image renderer uses no paid API.
 
 Never commit or share `.env`.
 
