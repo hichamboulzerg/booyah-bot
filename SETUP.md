@@ -27,6 +27,8 @@ Edit `.env` and set:
 - `ALLOWED_USER_IDS`: Telegram user IDs allowed to use the bot.
 - `FACEBOOK_PAGE_ID`: numeric Facebook Page ID.
 - `FACEBOOK_PAGE_ACCESS_TOKEN`: long-lived Page access token with the permissions required to publish Page videos.
+- `IMAGE_FACEBOOK_PAGE_ID`: ID of the separate education Page used by `/image`.
+- `IMAGE_FACEBOOK_PAGE_ACCESS_TOKEN`: access token for that education Page. Keep it separate so images can never be sent to the video Page accidentally.
 
 Never commit or share `.env`.
 

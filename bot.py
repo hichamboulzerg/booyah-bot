@@ -47,6 +47,7 @@ from telegram.ext import (
     CONFIRM,
 ) = range(8)
 EDIT_VALUE, SCHEDULE_VALUE = range(20, 22)
+IMAGE_WAIT_PHOTO, IMAGE_WAIT_CAPTION = range(30, 32)
 TIME_RANGE_RE = re.compile(
     r"^(?P<start>\d{1,3}:\d{2}:\d{2})-(?P<end>\d{1,3}:\d{2}:\d{2})$"
 )
@@ -209,6 +210,99 @@ def duplicate_reason(
 def make_headline(caption: str) -> str:
     words = caption.replace("\n", " ").split()
     return " ".join(words[:8])[:80] or "New video"
+
+
+def image_draft_path(image_root: Path, image_id: str) -> Path:
+    if not JOB_ID_RE.fullmatch(image_id):
+        raise RuntimeError("Invalid image draft ID")
+    root = image_root.resolve()
+    draft = (root / image_id).resolve()
+    if root not in draft.parents:
+        raise RuntimeError("Invalid image draft path")
+    return draft
+
+
+async def image_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await authorized(update, context):
+        return ConversationHandler.END
+    context.user_data.clear()
+    await update.message.reply_text(
+        "Send one educational image as a Telegram photo or image file. "
+        "It will use the separate education Facebook Page, never Booyah King."
+    )
+    return IMAGE_WAIT_PHOTO
+
+
+async def receive_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await authorized(update, context):
+        return ConversationHandler.END
+    message = update.message
+    telegram_file = None
+    suffix = ".jpg"
+    if message.photo:
+        telegram_file = await message.photo[-1].get_file()
+    elif message.document and (message.document.mime_type or "").startswith("image/"):
+        telegram_file = await message.document.get_file()
+        suffix = Path(message.document.file_name or "image.jpg").suffix.lower() or ".jpg"
+    if telegram_file is None:
+        await message.reply_text("Please send a JPG, PNG or WebP image.")
+        return IMAGE_WAIT_PHOTO
+    if suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
+        await message.reply_text("Supported image types: JPG, PNG and WebP.")
+        return IMAGE_WAIT_PHOTO
+
+    image_id = uuid.uuid4().hex
+    draft_dir = image_draft_path(context.application.bot_data["image_root"], image_id)
+    draft_dir.mkdir(parents=True, exist_ok=False)
+    image_path = draft_dir / f"image{suffix}"
+    try:
+        await telegram_file.download_to_drive(custom_path=image_path)
+    except Exception:
+        shutil.rmtree(draft_dir, ignore_errors=True)
+        raise
+    context.user_data["image_id"] = image_id
+    context.user_data["image_filename"] = image_path.name
+    await message.reply_text("Image received. Now send the Facebook caption.")
+    return IMAGE_WAIT_CAPTION
+
+
+async def receive_image_caption(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    if not await authorized(update, context):
+        return ConversationHandler.END
+    caption = update.message.text.strip()
+    if not caption:
+        await update.message.reply_text("The caption cannot be empty.")
+        return IMAGE_WAIT_CAPTION
+    image_id = context.user_data.get("image_id", "")
+    draft_dir = image_draft_path(context.application.bot_data["image_root"], image_id)
+    image_path = draft_dir / context.user_data["image_filename"]
+    draft = {
+        "image_id": image_id,
+        "user_id": update.effective_user.id,
+        "image_filename": image_path.name,
+        "caption": caption,
+        "status": "ready",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    (draft_dir / "image.json").write_text(
+        json.dumps(draft, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Publish to education Page", callback_data=f"image_publish:{image_id}"),
+        InlineKeyboardButton("Cancel", callback_data=f"image_cancel:{image_id}"),
+    ]])
+    with image_path.open("rb") as handle:
+        await update.message.reply_photo(
+            photo=handle,
+            caption=(f"Image preview\n\n{caption}")[:1024],
+            reply_markup=keyboard,
+            read_timeout=120,
+            write_timeout=120,
+        )
+    context.user_data.clear()
+    return ConversationHandler.END
 
 
 async def authorized(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -1032,6 +1126,101 @@ def resolve_page_access_token(config: dict[str, str]) -> str:
                 raise RuntimeError("The Facebook account cannot create Page content")
             return page["access_token"]
     raise RuntimeError("The configured Facebook Page is not managed by this token")
+
+
+def publish_image_to_facebook(image: Path, caption: str, config: dict[str, str]) -> str:
+    if not config.get("page_id") or not config.get("access_token"):
+        raise RuntimeError(
+            "Education Page is not configured. Add IMAGE_FACEBOOK_PAGE_ID and "
+            "IMAGE_FACEBOOK_PAGE_ACCESS_TOKEN to .env."
+        )
+    page_token = resolve_page_access_token(config)
+    endpoint = (
+        f"https://graph.facebook.com/{config['graph_version']}/"
+        f"{config['page_id']}/photos"
+    )
+    with image.open("rb") as handle:
+        response = requests.post(
+            endpoint,
+            data={
+                "access_token": page_token,
+                "caption": caption,
+                "published": "true",
+            },
+            files={"source": (image.name, handle, "application/octet-stream")},
+            timeout=(30, 300),
+        )
+    if not response.ok:
+        raise facebook_error(response)
+    result = response.json()
+    object_id = str(result.get("post_id") or result.get("id") or "")
+    if not object_id:
+        raise RuntimeError("Facebook accepted the image but returned no post ID")
+    lookup_id = str(result.get("id") or object_id)
+    lookup = requests.get(
+        f"https://graph.facebook.com/{config['graph_version']}/{lookup_id}",
+        params={"fields": "permalink_url", "access_token": page_token},
+        timeout=30,
+    )
+    if lookup.ok and lookup.json().get("permalink_url"):
+        return "https://www.facebook.com" + lookup.json()["permalink_url"]
+    return f"https://www.facebook.com/{object_id}"
+
+
+async def image_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await authorized(update, context):
+        return
+    query = update.callback_query
+    action, image_id = query.data.split(":", 1)
+    await query.answer()
+    try:
+        draft_dir = image_draft_path(
+            context.application.bot_data["image_root"], image_id
+        )
+        draft = json.loads(
+            (draft_dir / "image.json").read_text(encoding="utf-8-sig")
+        )
+        image_path = draft_dir / draft["image_filename"]
+    except Exception as exc:
+        await query.answer(f"Image draft unavailable: {exc}", show_alert=True)
+        return
+    if draft.get("user_id") != update.effective_user.id:
+        await query.answer("This image belongs to another user.", show_alert=True)
+        return
+    if action == "image_cancel":
+        shutil.rmtree(draft_dir, ignore_errors=True)
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text("Image post cancelled and cached image deleted.")
+        return
+    if draft.get("status") == "published":
+        await query.answer("This image is already published.", show_alert=True)
+        return
+    progress = await query.message.reply_text("Uploading image to education Page…")
+    try:
+        post_url = await asyncio.to_thread(
+            publish_image_to_facebook,
+            image_path,
+            draft["caption"],
+            context.application.bot_data["image_facebook"],
+        )
+    except Exception as exc:
+        LOGGER.exception("Facebook image upload failed")
+        draft["status"] = "upload_failed"
+        draft["last_error"] = str(exc)
+        (draft_dir / "image.json").write_text(
+            json.dumps(draft, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        await progress.edit_text(
+            f"Image upload failed: {exc}\n\nThe image is cached; press Publish again after fixing the Page settings."
+        )
+        return
+    draft["status"] = "published"
+    draft["post_url"] = post_url
+    (draft_dir / "image.json").write_text(
+        json.dumps(draft, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    await query.edit_message_reply_markup(reply_markup=None)
+    await progress.edit_text(f"Image published successfully.\n{post_url}")
 
 
 def facebook_error(response: requests.Response) -> RuntimeError:
@@ -2009,6 +2198,8 @@ def main() -> None:
     allowed_users = parse_allowed_users(required_setting("ALLOWED_USER_IDS"))
     download_root = base_dir / os.getenv("DOWNLOAD_DIR", "downloads")
     download_root.mkdir(parents=True, exist_ok=True)
+    image_root = download_root / "images"
+    image_root.mkdir(parents=True, exist_ok=True)
     state_db = base_dir / os.getenv("STATE_DB", "bot_state.db")
     init_state_db(state_db)
 
@@ -2026,6 +2217,7 @@ def main() -> None:
         max_batch_clips=int(os.getenv("MAX_BATCH_CLIPS", "6")),
         preview_max_bytes=int(os.getenv("TELEGRAM_PREVIEW_MAX_MB", "45")) * 1024 * 1024,
         download_root=download_root,
+        image_root=image_root,
         state_db=state_db,
         schedule_timezone=os.getenv("SCHEDULE_TIMEZONE", "UTC").strip(),
         draft_retention_days=int(os.getenv("DRAFT_RETENTION_DAYS", "14")),
@@ -2040,6 +2232,13 @@ def main() -> None:
             "graph_version": os.getenv("FACEBOOK_GRAPH_VERSION", "v23.0").strip(),
             "app_id": os.getenv("FACEBOOK_APP_ID", "").strip(),
             "app_secret": os.getenv("FACEBOOK_APP_SECRET", "").strip(),
+        },
+        image_facebook={
+            "page_id": os.getenv("IMAGE_FACEBOOK_PAGE_ID", "").strip(),
+            "access_token": os.getenv(
+                "IMAGE_FACEBOOK_PAGE_ACCESS_TOKEN", ""
+            ).strip(),
+            "graph_version": os.getenv("FACEBOOK_GRAPH_VERSION", "v23.0").strip(),
         },
         openai={
             "api_key": os.getenv("OPENAI_API_KEY", "").strip(),
@@ -2070,6 +2269,19 @@ def main() -> None:
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     application.add_handler(conversation)
+    image_conversation = ConversationHandler(
+        entry_points=[CommandHandler("image", image_start)],
+        states={
+            IMAGE_WAIT_PHOTO: [
+                MessageHandler(filters.PHOTO | filters.Document.IMAGE, receive_image)
+            ],
+            IMAGE_WAIT_CAPTION: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_image_caption)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+    application.add_handler(image_conversation)
     edit_conversation = ConversationHandler(
         entry_points=[
             CallbackQueryHandler(
@@ -2120,6 +2332,11 @@ def main() -> None:
     application.add_handler(
         CallbackQueryHandler(
             job_action, pattern=r"^(publish|retry|ai_caption|delete):[a-f0-9]{32}$"
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            image_action, pattern=r"^image_(publish|cancel):[a-f0-9]{32}$"
         )
     )
     application.add_handler(CommandHandler("cancel", cancel))
