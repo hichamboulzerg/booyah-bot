@@ -22,43 +22,54 @@ PAPER = "#fffdf4"
 LESSON_SCHEMA = {
     "type": "object",
     "properties": {
-        "title": {"type": "string"},
+        "title": {"type": "string", "maxLength": 55},
         "sections": {
             "type": "array",
-            "minItems": 3,
+            "minItems": 4,
             "maxItems": 4,
             "items": {
                 "type": "object",
                 "properties": {
-                    "heading": {"type": "string"},
+                    "heading": {"type": "string", "maxLength": 35},
                     "bullets": {
                         "type": "array",
-                        "minItems": 1,
-                        "maxItems": 2,
-                        "items": {"type": "string"},
+                        "minItems": 2,
+                        "maxItems": 3,
+                        "items": {"type": "string", "maxLength": 105},
                     },
                 },
                 "required": ["heading", "bullets"],
             },
         },
-        "example": {"type": "string"},
-        "caption": {"type": "string"},
+        "example": {"type": "string", "maxLength": 220},
+        "caption": {"type": "string", "maxLength": 300},
     },
     "required": ["title", "sections", "example", "caption"],
 }
 
 
 def _clean(value: object, limit: int) -> str:
-    return " ".join(str(value or "").split())[:limit]
+    cleaned = " ".join(str(value or "").split())
+    if len(cleaned) <= limit:
+        return cleaned
+    shortened = cleaned[: limit - 1].rsplit(" ", 1)[0].rstrip(" ,;:")
+    return (shortened or cleaned[: limit - 1]) + "…"
 
 
 def generate_lesson(topic: str, endpoint: str, model: str) -> dict:
     prompt = (
         "Create a technically accurate beginner lesson for a vertical educational "
-        f"infographic about {topic!r}. Use simple English. Make 3 or 4 sections, "
-        "each with 1 or 2 short bullets. Each heading must be under 35 characters; "
-        "each bullet under 90 characters. Add one concise example under 180 characters. "
-        "Do not use markdown. Verify facts before answering."
+        f"infographic about {topic!r}. Use simple English and explain ideas, not just "
+        "name them. Make exactly 4 sections with 2 or 3 useful bullets each. Cover "
+        "these four sections in this exact order: What It Is (definition and core "
+        "idea), How It Works (process or mechanism), Why It Matters (uses and "
+        "benefits), and Tips & Mistakes (practical advice and a misconception to "
+        "avoid). Do not put an example in any section; use only the separate example "
+        "field for that. Each heading must be under 35 characters and each bullet "
+        "under 105 characters. Add one practical example under 220 characters. "
+        "Avoid repeated points and temporary facts such as current IP addresses, "
+        "prices, dates, or software versions; use a generic placeholder when needed. "
+        "Do not use markdown. Carefully verify every fact."
     )
     response = requests.post(
         endpoint.rstrip("/") + "/api/generate",
@@ -76,16 +87,16 @@ def generate_lesson(topic: str, endpoint: str, model: str) -> dict:
     sections = []
     for section in payload.get("sections", [])[:4]:
         heading = _clean(section.get("heading"), 35)
-        bullets = [_clean(item, 90) for item in section.get("bullets", [])[:2]]
+        bullets = [_clean(item, 105) for item in section.get("bullets", [])[:3]]
         bullets = [item for item in bullets if item]
         if heading and bullets:
             sections.append({"heading": heading, "bullets": bullets})
-    if len(sections) < 3:
+    if len(sections) < 4:
         raise RuntimeError("The local model returned too few lesson sections")
     return {
         "title": _clean(payload.get("title") or topic, 55),
         "sections": sections,
-        "example": _clean(payload.get("example"), 180),
+        "example": _clean(payload.get("example"), 220),
         "caption": _clean(
             payload.get("caption") or f"Learn {topic} with this visual guide.", 500
         ),
@@ -131,7 +142,7 @@ def _bulb(draw: ImageDraw.ImageDraw, x: int, y: int) -> None:
 
 
 def render_notebook(lesson: dict, output: Path) -> None:
-    width, height = 1024, 1536
+    width, height = 1024, 1792
     image = Image.new("RGB", (width, height), PAPER)
     draw = ImageDraw.Draw(image)
 
@@ -154,19 +165,19 @@ def render_notebook(lesson: dict, output: Path) -> None:
     _bulb(draw, 900, 54)
 
     heading_font = _font("segoeprb.ttf", 37)
-    body_font = _font("comic.ttf", 29)
-    code_font = _font("consola.ttf", 25)
+    body_font = _font("comic.ttf", 26)
+    code_font = _font("consola.ttf", 23)
     y = 190
     content_left, content_right = 170, 940
     section_gap = 24
-    example_space = 220 if lesson.get("example") else 60
-    available = 1325 - y - example_space
+    example_top = 1530
+    available = example_top - 30 - y
     section_height = max(190, (available - section_gap * (len(lesson["sections"]) - 1)) // len(lesson["sections"]))
 
     colors = [RED, GREEN, "#7a3db8", "#c06b00"]
     for index, section in enumerate(lesson["sections"]):
         box_top = y
-        box_bottom = min(y + section_height, 1300 - example_space)
+        box_bottom = min(y + section_height, example_top - 30)
         draw.rounded_rectangle(
             (150, box_top, 960, box_bottom), radius=22,
             fill="#fffef8", outline="#31559a", width=3,
@@ -194,7 +205,7 @@ def render_notebook(lesson: dict, output: Path) -> None:
             )
             for line_index, line in enumerate(lines[:2]):
                 draw.text((content_left + 42, line_y), line, font=body_font, fill=INK)
-                line_y += 38
+                line_y += 34
             line_y += 8
             if line_y > box_bottom - 38:
                 break
@@ -202,13 +213,13 @@ def render_notebook(lesson: dict, output: Path) -> None:
 
     example = lesson.get("example", "")
     if example:
-        top = 1300
-        draw.rounded_rectangle((170, top, 940, 1480), radius=22, fill="#fff6c7", outline=RED, width=3)
+        top = example_top
+        draw.rounded_rectangle((170, top, 940, 1740), radius=22, fill="#fff6c7", outline=RED, width=3)
         draw.text((205, top + 15), "Example", font=heading_font, fill=RED)
         lines = _wrapped(draw, example, code_font, 690)
         for index, line in enumerate(lines[:3]):
-            draw.text((215, top + 70 + index * 34), line, font=code_font, fill=INK)
-        draw.text((790, 1430), "Save & learn!", font=_font("Inkfree.ttf", 28), fill=GREEN)
+            draw.text((215, top + 70 + index * 32), line, font=code_font, fill=INK)
+        draw.text((790, 1690), "Save & learn!", font=_font("Inkfree.ttf", 28), fill=GREEN)
 
     output.parent.mkdir(parents=True, exist_ok=True)
     image.save(output, format="PNG", optimize=True)
