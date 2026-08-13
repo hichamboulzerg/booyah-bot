@@ -780,11 +780,9 @@ async def setup_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         await query.edit_message_text(
             f"✅ {total} preview{'s' if total != 1 else ''} ready — 100%"
         )
-    except Exception:
+    except Exception as exc:
         LOGGER.exception("Preview preparation failed")
-        await query.edit_message_text(
-            "Preview preparation failed. Check the VPS log for details."
-        )
+        await query.edit_message_text(preview_preparation_error(exc))
     finally:
         shutil.rmtree(batch_dir, ignore_errors=True)
         context.user_data.clear()
@@ -825,6 +823,41 @@ def run_command(args: list[str]) -> None:
         raise RuntimeError(f"{args[0]} failed: {detail}")
 
 
+def yt_dlp_runtime_args() -> list[str]:
+    configured = os.getenv("DENO_PATH", ".tools/deno/deno.exe").strip()
+    deno_path = Path(configured)
+    if not deno_path.is_absolute():
+        deno_path = Path(__file__).resolve().parent / deno_path
+    if not deno_path.is_file():
+        raise RuntimeError(
+            f"Deno JavaScript runtime is missing at {deno_path}. "
+            "Install Deno 2.3 or newer and set DENO_PATH."
+        )
+    return ["--js-runtimes", f"deno:{deno_path}"]
+
+
+def preview_preparation_error(exc: Exception) -> str:
+    detail = str(exc)
+    lowered = detail.lower()
+    if "deno javascript runtime is missing" in lowered:
+        return "YouTube download support is not configured: " + detail
+    if "yt-dlp failed" in lowered and "403" in lowered:
+        return (
+            "YouTube refused the download (HTTP 403). The JavaScript challenge "
+            "runtime is installed now; send /start and retry the same link. If it "
+            "still fails, the specific video may require sign-in or be restricted."
+        )
+    if "yt-dlp failed" in lowered:
+        clean = " ".join(detail.split())[-700:]
+        return f"YouTube download failed. Retry the link. Details: {clean}"
+    if "ffmpeg" in lowered:
+        return (
+            "Video rendering failed, but any completed cached drafts were preserved. "
+            "Send /start to retry."
+        )
+    return f"Preview preparation failed: {' '.join(detail.split())[-700:]}"
+
+
 def download_video(
     url: str, job_dir: Path, ffmpeg_exe: str, max_video_height: int
 ) -> tuple[Path, dict]:
@@ -836,6 +869,7 @@ def download_video(
     run_command(
         [
             "yt-dlp", "--no-playlist", "--restrict-filenames",
+            *yt_dlp_runtime_args(),
             "--merge-output-format", "mp4", "--write-info-json",
             "--ffmpeg-location", ffmpeg_exe, "-f", format_selector,
             "-o", output_template, url,
@@ -1746,6 +1780,7 @@ def download_audio_chunks(url: str, work_dir: Path, ffmpeg_exe: str, max_minutes
     run_command(
         [
             "yt-dlp", "--no-playlist", "--restrict-filenames", "-f", "bestaudio/best",
+            *yt_dlp_runtime_args(),
             "--ffmpeg-location", ffmpeg_exe, "-o", template, url,
         ]
     )

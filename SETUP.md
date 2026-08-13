@@ -31,6 +31,7 @@ Edit `.env` and set:
 - `IMAGE_FACEBOOK_PAGE_ACCESS_TOKEN`: access token for that education Page. Keep it separate so images can never be sent to the video Page accidentally.
 - `OLLAMA_ENDPOINT`: local Ollama server used by `/create_image`.
 - `OLLAMA_MODEL`: local lesson-writing model (default `llama3.1:8b`). The image renderer uses no paid API.
+- `DENO_PATH`: Deno executable used by yt-dlp for YouTube JavaScript challenges (default `.tools/deno/deno.exe`). Install Deno 2.3 or newer.
 
 `/create_image` accepts any educational topic and builds an adaptive 3-to-5-slide
 notebook-style carousel. Every slide contains three explanations and a practical
