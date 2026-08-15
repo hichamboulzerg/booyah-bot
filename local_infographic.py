@@ -65,27 +65,39 @@ CAROUSEL_SCHEMA = {
                     "subtitle": {"type": "string", "maxLength": 100},
                     "points": {
                         "type": "array",
-                        "minItems": 3,
-                        "maxItems": 3,
+                        "minItems": 2,
+                        "maxItems": 2,
                         "items": {
                             "type": "object",
                             "properties": {
                                 "heading": {"type": "string", "maxLength": 35},
                                 "explanation": {
                                     "type": "string",
-                                    "maxLength": 180,
+                                    "maxLength": 150,
                                 },
                             },
                             "required": ["heading", "explanation"],
                         },
                     },
-                    "example": {
-                        "type": "string",
-                        "minLength": 10,
-                        "maxLength": 180,
+                    "examples": {
+                        "type": "array",
+                        "minItems": 2,
+                        "maxItems": 2,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string", "maxLength": 24},
+                                "content": {
+                                    "type": "string",
+                                    "minLength": 10,
+                                    "maxLength": 170,
+                                },
+                            },
+                            "required": ["label", "content"],
+                        },
                     },
                 },
-                "required": ["title", "subtitle", "points", "example"],
+                "required": ["title", "subtitle", "points", "examples"],
             },
         },
     },
@@ -157,12 +169,14 @@ def generate_carousel_lesson(topic: str, endpoint: str, model: str) -> dict:
         "must form one progressive lesson: begin with the foundation, explain the "
         "important ideas or process, show practical meaning or use, include concrete "
         "examples where helpful, and finish with key takeaways, advice, limitations, "
-        "or common mistakes. Every slide needs exactly 3 distinct teaching points. "
+        "or common mistakes. Every slide needs exactly 2 distinct teaching points. "
         "A point heading names the idea; its explanation says what it means and why "
-        "it matters in simple English. Use the example field only for a practical "
-        "example, scenario, calculation, quotation-free illustration, or short code "
-        "sample. Every slide must have one short, concrete example that directly "
-        "demonstrates its teaching points. Avoid filler, repeated points, markdown, "
+        "it matters in simple English. Every slide must also have exactly 2 different "
+        "concrete examples. Examples can be short code samples, worked calculations, "
+        "real-life scenarios, mini exercises, comparisons, or demonstrations, chosen "
+        "to fit the topic. Give each example a useful short label. Examples must show "
+        "how the ideas are applied, not repeat the explanations. Avoid filler, "
+        "repeated points, markdown, "
         "unsafe instructions, and "
         "temporary facts such as current prices, live IP addresses, or version "
         "numbers. Keep facts stable and carefully verify them before answering."
@@ -176,7 +190,7 @@ def generate_carousel_lesson(topic: str, endpoint: str, model: str) -> dict:
             "prompt": prompt,
             "stream": False,
             "format": CAROUSEL_SCHEMA,
-            "options": {"temperature": 0.15, "num_predict": 1800},
+            "options": {"temperature": 0.18, "num_predict": 2200},
         },
         timeout=(10, 900),
     )
@@ -185,25 +199,31 @@ def generate_carousel_lesson(topic: str, endpoint: str, model: str) -> dict:
     slides = []
     for raw_slide in payload.get("slides", [])[:5]:
         points = []
-        for raw_point in raw_slide.get("points", [])[:3]:
+        for raw_point in raw_slide.get("points", [])[:2]:
             heading = _clean(raw_point.get("heading"), 35)
-            explanation = _clean(raw_point.get("explanation"), 180)
+            explanation = _clean(raw_point.get("explanation"), 150)
             if heading and explanation:
                 points.append({"heading": heading, "explanation": explanation})
-        if len(points) != 3:
+        if len(points) != 2:
+            continue
+        examples = []
+        for raw_example in raw_slide.get("examples", [])[:2]:
+            label = _clean(raw_example.get("label"), 24)
+            content = _clean(raw_example.get("content"), 170)
+            if label and content:
+                examples.append({"label": label, "content": content})
+        if len(examples) != 2:
             continue
         slides.append(
             {
                 "title": _clean(raw_slide.get("title"), 48),
                 "subtitle": _clean(raw_slide.get("subtitle"), 100),
                 "points": points,
-                "example": _clean(raw_slide.get("example"), 180),
+                "examples": examples,
             }
         )
     if not 3 <= len(slides) <= 5:
         raise RuntimeError("The local model did not return 3 to 5 complete slides")
-    if not all(slide["example"] for slide in slides):
-        raise RuntimeError("The local model omitted a required practical example")
     all_headings = [
         point["heading"].casefold()
         for slide in slides
@@ -218,8 +238,20 @@ def generate_carousel_lesson(topic: str, endpoint: str, model: str) -> dict:
     ]
     if len(all_explanations) != len(set(all_explanations)):
         raise RuntimeError("The local model repeated an explanation")
+    all_examples = [
+        example["content"].casefold()
+        for slide in slides
+        for example in slide["examples"]
+    ]
+    if len(all_examples) != len(set(all_examples)):
+        raise RuntimeError("The local model repeated a practical example")
     combined = " ".join(
-        all_explanations + [slide["example"].casefold() for slide in slides]
+        all_explanations
+        + [
+            example["content"].casefold()
+            for slide in slides
+            for example in slide["examples"]
+        ]
     )
     temporary_patterns = (
         r"\bcurrent price\b",
@@ -383,27 +415,42 @@ def render_carousel_slide(
     output: Path,
 ) -> None:
     width, height = 1024, 1536
-    image = Image.new("RGB", (width, height), PAPER)
+    themes = [
+        {"paper": "#fffdf4", "accent": "#1746a2", "second": "#d43931", "soft": "#fff2bd"},
+        {"paper": "#f3fff8", "accent": "#087f5b", "second": "#e67700", "soft": "#d8f5e8"},
+        {"paper": "#fcf7ff", "accent": "#7048b5", "second": "#d6336c", "soft": "#eee2ff"},
+        {"paper": "#fff8ef", "accent": "#b45309", "second": "#2563a5", "soft": "#ffe4bd"},
+        {"paper": "#f5fbff", "accent": "#176b87", "second": "#c93663", "soft": "#dff3fb"},
+    ]
+    designs = ["stacked", "split", "example_first", "steps", "sticky"]
+    theme = themes[(slide_number - 1) % len(themes)]
+    design = designs[(slide_number - 1) % len(designs)]
+    image = Image.new("RGB", (width, height), theme["paper"])
     draw = ImageDraw.Draw(image)
-    for y in range(78, height, 54):
-        draw.line((0, y, width, y), fill="#bddbf1", width=2)
+    if design in {"stacked", "example_first", "steps"}:
+        for y in range(78, height, 54):
+            draw.line((0, y, width, y), fill="#c6deec", width=2)
+    else:
+        for x in range(140, width, 42):
+            for y in range(110, height, 42):
+                draw.ellipse((x, y, x + 3, y + 3), fill="#cbd9df")
     draw.line((112, 0, 112, height), fill="#e99797", width=3)
     for y in range(28, height, 72):
         draw.ellipse((15, y, 43, y + 28), fill="#363636")
         draw.arc((-15, y - 10, 35, y + 42), 250, 110, fill="#111111", width=6)
 
-    draw.rounded_rectangle((840, 28, 970, 82), radius=22, fill=BLUE)
+    draw.rounded_rectangle((840, 28, 970, 82), radius=22, fill=theme["accent"])
     slide_label = f"{slide_number} / {slide_count}"
     label_font = _font("arialbd.ttf", 25)
     label_x = 905 - draw.textlength(slide_label, font=label_font) / 2
     draw.text((label_x, 40), slide_label, font=label_font, fill="white")
 
-    title_font = _font("Inkfree.ttf", 68)
+    title_font = _font("Inkfree.ttf", 64)
     while draw.textlength(slide["title"], font=title_font) > 650 and title_font.size > 34:
         title_font = _font("Inkfree.ttf", title_font.size - 4)
     title_x = 160 + (650 - draw.textlength(slide["title"], font=title_font)) / 2
-    draw.text((title_x, 35), slide["title"], font=title_font, fill=BLUE, stroke_width=1)
-    draw.line((205, 125, 920, 125), fill=BLUE, width=5)
+    draw.text((title_x, 35), slide["title"], font=title_font, fill=theme["accent"], stroke_width=1)
+    draw.line((205, 125, 920, 125), fill=theme["accent"], width=5)
     subtitle_font = _font("comic.ttf", 25)
     subtitle_lines = _wrapped(draw, slide["subtitle"], subtitle_font, 730)[:2]
     for index, line in enumerate(subtitle_lines):
@@ -411,62 +458,67 @@ def render_carousel_slide(
         draw.text((line_x, 145 + index * 32), line, font=subtitle_font, fill=INK)
     _star(draw, 153, 82, 23)
 
-    heading_font = _font("segoeprb.ttf", 33)
-    body_font = _font("comic.ttf", 26)
-    colors = [RED, GREEN, "#7a3db8"]
-    card_top = 225
-    card_height = 295 if slide.get("example") else 340
-    card_gap = 22
-    for index, point in enumerate(slide["points"]):
-        top = card_top + index * (card_height + card_gap)
-        bottom = top + card_height
-        draw.rounded_rectangle(
-            (145, top, 960, bottom),
-            radius=22,
-            fill="#fffef8",
-            outline="#31559a",
-            width=3,
-        )
-        _star(draw, 175, top + 40, 19)
-        point_font = heading_font
-        while (
-            draw.textlength(point["heading"], font=point_font) > 680
-            and point_font.size > 25
-        ):
-            point_font = _font("segoeprb.ttf", point_font.size - 2)
-        draw.text((212, top + 18), point["heading"], font=point_font, fill=BLUE)
-        underline_end = min(
-            900, 212 + int(draw.textlength(point["heading"], font=point_font))
-        )
-        draw.line((212, top + 62, underline_end, top + 62), fill=colors[index], width=4)
-        explanation_lines = _wrapped(
-            draw, point["explanation"], body_font, 700
-        )[:5]
-        for line_index, line in enumerate(explanation_lines):
-            draw.text(
-                (205, top + 88 + line_index * 36), line, font=body_font, fill=INK
-            )
+    heading_font = _font("segoeprb.ttf", 31)
+    body_font = _font("comic.ttf", 25)
+    example_font = _font("consola.ttf", 22)
 
-    if slide.get("example"):
-        example_top = 1190
-        draw.rounded_rectangle(
-            (165, example_top, 945, 1470),
-            radius=22,
-            fill="#fff6c7",
-            outline=RED,
-            width=3,
-        )
-        draw.text((200, example_top + 15), "Example", font=heading_font, fill=RED)
-        example_font = _font("consola.ttf", 23)
-        lines = _wrapped(draw, slide["example"], example_font, 700)[:5]
-        for index, line in enumerate(lines):
-            draw.text(
-                (205, example_top + 68 + index * 32), line, font=example_font, fill=INK
-            )
+    def card(box, heading, text, fill, accent, example=False, number=None):
+        left, top, right, bottom = box
+        draw.rounded_rectangle(box, radius=22, fill=fill, outline=accent, width=3)
+        heading_x = left + 40
+        if number is not None:
+            draw.ellipse((left + 22, top + 20, left + 70, top + 68), fill=accent)
+            nfont = _font("arialbd.ttf", 24)
+            draw.text((left + 39, top + 29), str(number), font=nfont, fill="white")
+            heading_x = left + 88
+        hfont = heading_font
+        max_heading = right - heading_x - 25
+        while draw.textlength(heading, font=hfont) > max_heading and hfont.size > 23:
+            hfont = _font("segoeprb.ttf", hfont.size - 2)
+        draw.text((heading_x, top + 22), heading, font=hfont, fill=accent)
+        draw.line((heading_x, top + 63, min(right - 25, heading_x + int(draw.textlength(heading, font=hfont))), top + 63), fill=accent, width=4)
+        font = example_font if example else body_font
+        lines = _wrapped(draw, text, font, right - left - 80)[:6]
+        for line_index, line in enumerate(lines):
+            draw.text((left + 40, top + 88 + line_index * 34), line, font=font, fill=INK)
+
+    points = slide["points"]
+    examples = slide["examples"]
+    if design == "stacked":
+        card((150, 225, 960, 480), points[0]["heading"], points[0]["explanation"], "#fffef8", theme["accent"])
+        card((150, 505, 960, 760), points[1]["heading"], points[1]["explanation"], "#fffef8", theme["second"])
+        card((150, 785, 960, 1085), examples[0]["label"], examples[0]["content"], theme["soft"], theme["accent"], True)
+        card((150, 1110, 960, 1410), examples[1]["label"], examples[1]["content"], "#ffe9df", theme["second"], True)
+    elif design == "split":
+        draw.text((155, 215), "KEY IDEAS", font=_font("arialbd.ttf", 23), fill=theme["accent"])
+        draw.text((570, 215), "SEE IT IN ACTION", font=_font("arialbd.ttf", 23), fill=theme["second"])
+        card((145, 260, 535, 790), points[0]["heading"], points[0]["explanation"], "#fffef8", theme["accent"])
+        card((145, 815, 535, 1345), points[1]["heading"], points[1]["explanation"], "#fffef8", theme["accent"])
+        card((555, 260, 960, 790), examples[0]["label"], examples[0]["content"], theme["soft"], theme["second"], True)
+        card((555, 815, 960, 1345), examples[1]["label"], examples[1]["content"], "#fff0d8", theme["second"], True)
+    elif design == "example_first":
+        draw.rounded_rectangle((145, 215, 960, 265), radius=18, fill=theme["second"])
+        draw.text((375, 224), "START WITH EXAMPLES", font=_font("arialbd.ttf", 23), fill="white")
+        card((150, 290, 960, 555), examples[0]["label"], examples[0]["content"], theme["soft"], theme["second"], True)
+        card((150, 580, 960, 845), examples[1]["label"], examples[1]["content"], "#ffe9df", theme["second"], True)
+        card((150, 875, 960, 1120), points[0]["heading"], points[0]["explanation"], "#fffef8", theme["accent"])
+        card((150, 1145, 960, 1390), points[1]["heading"], points[1]["explanation"], "#fffef8", theme["accent"])
+    elif design == "steps":
+        draw.line((190, 270, 190, 1330), fill=theme["accent"], width=8)
+        card((225, 225, 960, 470), points[0]["heading"], points[0]["explanation"], "#fffef8", theme["accent"], number=1)
+        card((225, 495, 960, 740), examples[0]["label"], examples[0]["content"], theme["soft"], theme["second"], True, 2)
+        card((225, 765, 960, 1010), points[1]["heading"], points[1]["explanation"], "#fffef8", theme["accent"], number=3)
+        card((225, 1035, 960, 1325), examples[1]["label"], examples[1]["content"], "#ffe9df", theme["second"], True, 4)
+    else:
+        positions = [(145, 235, 535, 735), (565, 235, 955, 735), (145, 765, 535, 1345), (565, 765, 955, 1345)]
+        card(positions[0], points[0]["heading"], points[0]["explanation"], "#fff6c7", theme["accent"])
+        card(positions[1], examples[0]["label"], examples[0]["content"], "#e4f5e9", theme["second"], True)
+        card(positions[2], examples[1]["label"], examples[1]["content"], "#f2e7ff", theme["second"], True)
+        card(positions[3], points[1]["heading"], points[1]["explanation"], "#ffe7df", theme["accent"])
 
     footer_font = _font("Inkfree.ttf", 25)
     footer = _clean(course_title, 50)
-    draw.text((155, 1493), footer, font=footer_font, fill=GREEN)
+    draw.text((155, 1493), footer, font=footer_font, fill=theme["accent"])
     output.parent.mkdir(parents=True, exist_ok=True)
     image.save(output, format="PNG", optimize=True)
 
@@ -489,7 +541,11 @@ def create_carousel(
                 f"{point['heading']}: {point['explanation']}"
                 for point in slide["points"]
             )
-            + (f"\nExample: {slide['example']}" if slide["example"] else "")
+            + "\n"
+            + "\n".join(
+                f"{example['label']}: {example['content']}"
+                for example in slide["examples"]
+            )
             for index, slide in enumerate(lesson["slides"], start=1)
         ]
     )

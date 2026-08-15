@@ -34,8 +34,10 @@ Edit `.env` and set:
 - `DENO_PATH`: Deno executable used by yt-dlp for YouTube JavaScript challenges (default `.tools/deno/deno.exe`). Install Deno 2.3 or newer.
 
 `/create_image` accepts any educational topic and builds an adaptive 3-to-5-slide
-notebook-style carousel. Every slide contains three explanations and a practical
-example. Telegram previews the complete album before Facebook publishing.
+notebook-style carousel. Every slide contains two concise teaching points and two
+distinct practical examples. Five rotating visual layouts keep the album varied while
+preserving the Study Sketch identity. Telegram previews the complete album before
+Facebook publishing.
 
 Never commit or share `.env`.
 
