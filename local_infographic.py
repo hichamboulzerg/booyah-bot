@@ -11,6 +11,8 @@ from pathlib import Path
 import requests
 from PIL import Image, ImageDraw, ImageFont
 
+from claude_provider import claude_json
+
 
 BLUE = "#123ca0"
 RED = "#c7352d"
@@ -113,7 +115,13 @@ def _clean(value: object, limit: int) -> str:
     return (shortened or cleaned[: limit - 1]) + "…"
 
 
-def generate_lesson(topic: str, endpoint: str, model: str) -> dict:
+def generate_lesson(
+    topic: str,
+    endpoint: str,
+    model: str,
+    claude_api_key: str = "",
+    claude_model: str = "claude-sonnet-4-6",
+) -> dict:
     prompt = (
         "Create a technically accurate beginner lesson for a vertical educational "
         f"infographic about {topic!r}. Use simple English and explain ideas, not just "
@@ -128,19 +136,24 @@ def generate_lesson(topic: str, endpoint: str, model: str) -> dict:
         "prices, dates, or software versions; use a generic placeholder when needed. "
         "Do not use markdown. Carefully verify every fact."
     )
-    response = requests.post(
-        endpoint.rstrip("/") + "/api/generate",
-        json={
-            "model": model,
-            "prompt": prompt,
-            "stream": False,
-            "format": LESSON_SCHEMA,
-            "options": {"temperature": 0.2, "num_predict": 700},
-        },
-        timeout=(10, 600),
-    )
-    response.raise_for_status()
-    payload = json.loads(response.json()["response"])
+    if claude_api_key:
+        payload = claude_json(
+            claude_api_key, claude_model, prompt, LESSON_SCHEMA, max_tokens=1200
+        )
+    else:
+        response = requests.post(
+            endpoint.rstrip("/") + "/api/generate",
+            json={
+                "model": model,
+                "prompt": prompt,
+                "stream": False,
+                "format": LESSON_SCHEMA,
+                "options": {"temperature": 0.2, "num_predict": 700},
+            },
+            timeout=(10, 600),
+        )
+        response.raise_for_status()
+        payload = json.loads(response.json()["response"])
     sections = []
     for section in payload.get("sections", [])[:4]:
         heading = _clean(section.get("heading"), 35)
@@ -160,7 +173,13 @@ def generate_lesson(topic: str, endpoint: str, model: str) -> dict:
     }
 
 
-def generate_carousel_lesson(topic: str, endpoint: str, model: str) -> dict:
+def generate_carousel_lesson(
+    topic: str,
+    endpoint: str,
+    model: str,
+    claude_api_key: str = "",
+    claude_model: str = "claude-sonnet-4-6",
+) -> dict:
     prompt = (
         "Plan a valuable, beginner-friendly educational image carousel about "
         f"{topic!r}. This topic can belong to ANY field, so adapt the teaching "
@@ -171,10 +190,12 @@ def generate_carousel_lesson(topic: str, endpoint: str, model: str) -> dict:
         "examples where helpful, and finish with key takeaways, advice, limitations, "
         "or common mistakes. Every slide needs exactly 2 distinct teaching points. "
         "A point heading names the idea; its explanation says what it means and why "
-        "it matters in simple English. Every slide must also have exactly 2 different "
+        "it matters in simple English. Keep point headings under 35 characters and "
+        "explanations under 150 characters. Every slide must also have exactly 2 different "
         "concrete examples. Examples can be short code samples, worked calculations, "
         "real-life scenarios, mini exercises, comparisons, or demonstrations, chosen "
-        "to fit the topic. Give each example a useful short label. Examples must show "
+        "to fit the topic. Keep example labels under 24 characters and example content "
+        "under 170 characters. Give each example a useful, complete short label. Examples must show "
         "how the ideas are applied, not repeat the explanations. Avoid filler, "
         "repeated points, markdown, "
         "unsafe instructions, and "
@@ -183,19 +204,28 @@ def generate_carousel_lesson(topic: str, endpoint: str, model: str) -> dict:
         " Write a specific, engaging Facebook caption that summarizes what the "
         "reader will learn; do not use a generic phrase such as educational carousel."
     )
-    response = requests.post(
-        endpoint.rstrip("/") + "/api/generate",
-        json={
-            "model": model,
-            "prompt": prompt,
-            "stream": False,
-            "format": CAROUSEL_SCHEMA,
-            "options": {"temperature": 0.18, "num_predict": 2200},
-        },
-        timeout=(10, 900),
-    )
-    response.raise_for_status()
-    payload = json.loads(response.json()["response"])
+    if claude_api_key:
+        payload = claude_json(
+            claude_api_key,
+            claude_model,
+            prompt,
+            CAROUSEL_SCHEMA,
+            max_tokens=3600,
+        )
+    else:
+        response = requests.post(
+            endpoint.rstrip("/") + "/api/generate",
+            json={
+                "model": model,
+                "prompt": prompt,
+                "stream": False,
+                "format": CAROUSEL_SCHEMA,
+                "options": {"temperature": 0.18, "num_predict": 2200},
+            },
+            timeout=(10, 900),
+        )
+        response.raise_for_status()
+        payload = json.loads(response.json()["response"])
     slides = []
     for raw_slide in payload.get("slides", [])[:5]:
         points = []
@@ -392,9 +422,16 @@ def render_notebook(lesson: dict, output: Path) -> None:
 
 
 def create_infographic(
-    topic: str, output: Path, endpoint: str, model: str
+    topic: str,
+    output: Path,
+    endpoint: str,
+    model: str,
+    claude_api_key: str = "",
+    claude_model: str = "claude-sonnet-4-6",
 ) -> tuple[str, str]:
-    lesson = generate_lesson(topic, endpoint, model)
+    lesson = generate_lesson(
+        topic, endpoint, model, claude_api_key, claude_model
+    )
     render_notebook(lesson, output)
     lesson_text = "\n".join(
         [lesson["title"]]
@@ -473,7 +510,7 @@ def render_carousel_slide(
             heading_x = left + 88
         hfont = heading_font
         max_heading = right - heading_x - 25
-        while draw.textlength(heading, font=hfont) > max_heading and hfont.size > 23:
+        while draw.textlength(heading, font=hfont) > max_heading and hfont.size > 17:
             hfont = _font("segoeprb.ttf", hfont.size - 2)
         draw.text((heading_x, top + 22), heading, font=hfont, fill=accent)
         draw.line((heading_x, top + 63, min(right - 25, heading_x + int(draw.textlength(heading, font=hfont))), top + 63), fill=accent, width=4)
@@ -524,9 +561,16 @@ def render_carousel_slide(
 
 
 def create_carousel(
-    topic: str, output_dir: Path, endpoint: str, model: str
+    topic: str,
+    output_dir: Path,
+    endpoint: str,
+    model: str,
+    claude_api_key: str = "",
+    claude_model: str = "claude-sonnet-4-6",
 ) -> tuple[list[Path], str, str]:
-    lesson = generate_carousel_lesson(topic, endpoint, model)
+    lesson = generate_carousel_lesson(
+        topic, endpoint, model, claude_api_key, claude_model
+    )
     paths = []
     for index, slide in enumerate(lesson["slides"], start=1):
         path = output_dir / f"slide-{index}.png"

@@ -25,6 +25,7 @@ import imageio_ffmpeg
 import requests
 import growth_tools as growth
 from local_infographic import create_carousel
+from claude_provider import claude_text
 from requests_toolbelt import MultipartEncoder, MultipartEncoderMonitor
 from dotenv import load_dotenv
 from telegram import (
@@ -326,12 +327,15 @@ def generate_education_images(
     topic: str,
     draft_dir: Path,
     local_config: dict,
+    claude_config: dict,
 ) -> tuple[list[Path], str, str]:
     return create_carousel(
         topic,
         draft_dir,
         local_config["endpoint"],
         local_config["model"],
+        claude_config["api_key"],
+        claude_config["model"],
     )
 
 
@@ -374,6 +378,8 @@ async def send_carousel_preview(
 
 def image_generation_error_message(exc: Exception) -> str:
     text = str(exc)
+    if "Claude API error" in text or "ANTHROPIC_API_KEY" in text:
+        return f"Claude image planning failed: {text[:500]}"
     if "connection" in text.lower() or "11434" in text:
         return (
             "The local Ollama service is unavailable. Start Ollama, then run "
@@ -407,9 +413,11 @@ async def receive_generated_image_topic(
     if not topic:
         await update.message.reply_text("The topic cannot be empty.")
         return GENERATE_IMAGE_TOPIC
+    using_claude = bool(context.application.bot_data["claude"]["api_key"])
+    provider = "Claude" if using_claude else "the local model"
     progress = await update.message.reply_text(
-        "Planning the lesson and generating 3 to 5 notebook-style slides. This can "
-        "take several minutes on the local model…"
+        "Planning the lesson and generating 3 to 5 notebook-style slides with "
+        f"{provider}…"
     )
     image_id = uuid.uuid4().hex
     draft_dir = image_draft_path(context.application.bot_data["image_root"], image_id)
@@ -420,6 +428,7 @@ async def receive_generated_image_topic(
             topic,
             draft_dir,
             context.application.bot_data["local_image"],
+            context.application.bot_data["claude"],
         )
     except Exception as exc:
         shutil.rmtree(draft_dir, ignore_errors=True)
@@ -521,6 +530,7 @@ async def choose_source_action(update: Update, context: ContextTypes.DEFAULT_TYP
         return ASK_TRIM
 
     ai = context.application.bot_data["openai"]
+    claude = context.application.bot_data["claude"]
     if not ai["api_key"]:
         await query.edit_message_text(
             "AI highlights need OPENAI_API_KEY in .env.\n\n"
@@ -538,6 +548,7 @@ async def choose_source_action(update: Update, context: ContextTypes.DEFAULT_TYP
             context.user_data["youtube_url"],
             context.application.bot_data["download_root"],
             ai,
+            claude,
         )
     except Exception:
         LOGGER.exception("AI highlight analysis failed")
@@ -1440,6 +1451,7 @@ async def image_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 draft["topic"],
                 draft_dir,
                 context.application.bot_data["local_image"],
+                context.application.bot_data["claude"],
             )
         except Exception as exc:
             LOGGER.exception("Education image regeneration failed")
@@ -1757,8 +1769,11 @@ def openai_client(config: dict[str, str]):
     return OpenAI(api_key=config["api_key"])
 
 
-def generate_caption(job: dict, config: dict[str, str]) -> str:
-    client = openai_client(config)
+def generate_caption(
+    job: dict,
+    openai_config: dict[str, str],
+    claude_config: dict[str, str],
+) -> str:
     prompt = (
         "Write one engaging Facebook video caption. Keep it under 500 characters, "
         "use a strong hook, one call to action, and 3-5 relevant hashtags. "
@@ -1768,8 +1783,19 @@ def generate_caption(job: dict, config: dict[str, str]) -> str:
         f"Current caption: {job.get('caption', '')}\n"
         f"Description: {job.get('description', '')[:1500]}"
     )
-    response = client.responses.create(model=config["text_model"], input=prompt)
-    caption = response.output_text.strip()
+    if claude_config["api_key"]:
+        caption = claude_text(
+            claude_config["api_key"],
+            claude_config["model"],
+            prompt,
+            max_tokens=500,
+        ).strip()
+    else:
+        client = openai_client(openai_config)
+        response = client.responses.create(
+            model=openai_config["text_model"], input=prompt
+        )
+        caption = response.output_text.strip()
     if not caption:
         raise RuntimeError("The AI returned an empty caption")
     return caption[:1000]
@@ -1801,7 +1827,10 @@ def download_audio_chunks(url: str, work_dir: Path, ffmpeg_exe: str, max_minutes
 
 
 def find_highlights(
-    url: str, download_root: Path, config: dict[str, str]
+    url: str,
+    download_root: Path,
+    config: dict[str, str],
+    claude_config: dict[str, str],
 ) -> str:
     client = openai_client(config)
     work_dir = download_root / f"analysis-{uuid.uuid4().hex}"
@@ -1835,8 +1864,16 @@ def find_highlights(
             "this format: HH:MM:SS-HH:MM:SS — short reason. Do not add other text.\n\n"
             + "\n".join(transcript_lines)
         )
-        response = client.responses.create(model=config["text_model"], input=prompt)
-        result = response.output_text.strip()
+        if claude_config["api_key"]:
+            result = claude_text(
+                claude_config["api_key"],
+                claude_config["model"],
+                prompt,
+                max_tokens=900,
+            ).strip()
+        else:
+            response = client.responses.create(model=config["text_model"], input=prompt)
+            result = response.output_text.strip()
         if not result:
             raise RuntimeError("The AI returned no highlight suggestions")
         return result
@@ -2860,12 +2897,16 @@ async def job_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     if action == "ai_caption":
         ai = context.application.bot_data["openai"]
-        if not ai["api_key"]:
-            await query.answer("Add OPENAI_API_KEY to .env first.", show_alert=True)
+        claude = context.application.bot_data["claude"]
+        if not ai["api_key"] and not claude["api_key"]:
+            await query.answer(
+                "Add ANTHROPIC_API_KEY or OPENAI_API_KEY to .env first.",
+                show_alert=True,
+            )
             return
         progress = await query.message.reply_text("✨ Generating AI caption...")
         try:
-            caption = await asyncio.to_thread(generate_caption, job, ai)
+            caption = await asyncio.to_thread(generate_caption, job, ai, claude)
         except Exception:
             LOGGER.exception("AI caption generation failed")
             await progress.edit_text("AI caption generation failed. Check the VPS log.")
@@ -2985,6 +3026,10 @@ def main() -> None:
             "text_model": os.getenv("OPENAI_TEXT_MODEL", "gpt-4.1-mini").strip(),
             "transcribe_model": os.getenv("OPENAI_TRANSCRIBE_MODEL", "whisper-1").strip(),
             "max_minutes": int(os.getenv("AI_HIGHLIGHT_MAX_MINUTES", "60")),
+        },
+        claude={
+            "api_key": os.getenv("ANTHROPIC_API_KEY", "").strip(),
+            "model": os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6").strip(),
         },
     )
 

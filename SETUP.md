@@ -31,6 +31,8 @@ Edit `.env` and set:
 - `IMAGE_FACEBOOK_PAGE_ACCESS_TOKEN`: access token for that education Page. Keep it separate so images can never be sent to the video Page accidentally.
 - `OLLAMA_ENDPOINT`: local Ollama server used by `/create_image`.
 - `OLLAMA_MODEL`: local lesson-writing model (default `llama3.1:8b`). The image renderer uses no paid API.
+- `ANTHROPIC_API_KEY`: enables Claude lesson planning, carousel captions, video captions, and highlight selection.
+- `ANTHROPIC_MODEL`: Claude model used for writing and analysis (default `claude-sonnet-4-6`).
 - `DENO_PATH`: Deno executable used by yt-dlp for YouTube JavaScript challenges (default `.tools/deno/deno.exe`). Install Deno 2.3 or newer.
 
 `/create_image` accepts any educational topic and builds an adaptive 3-to-5-slide
@@ -60,7 +62,8 @@ Use Task Scheduler to run `.venv\Scripts\python.exe` with `bot.py` as the argume
 - A failed Facebook upload shows a Retry button and does not download or render again.
 - Downloads default to Facebook-ready H.264/AAC at 720p for faster trimming and uploading. Change `MAX_VIDEO_HEIGHT` in `.env` if needed.
 - Put a transparent logo at `assets/logo.png`. Without one, the text watermark still appears.
-- Add `OPENAI_API_KEY` to `.env` to enable AI highlight suggestions and AI captions.
+- Add `ANTHROPIC_API_KEY` to use Claude for image lessons, captions, and highlight selection. Images are still rendered locally.
+- `OPENAI_API_KEY` remains required for speech transcription in AI video highlights. If Claude is unavailable, OpenAI also remains the text-generation fallback.
 - AI highlights transcribe at most `AI_HIGHLIGHT_MAX_MINUTES` from each source.
 - Telegram receives progress by stage and a preview when the processed file fits the configured preview limit.
 - Enter multiple comma-separated trim ranges to create a batch from one YouTube download (up to `MAX_BATCH_CLIPS`).
